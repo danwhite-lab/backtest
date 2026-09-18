@@ -14,6 +14,7 @@
 # - Absolute Momentum
 # - Dual Momentum
 # - Relative Momentum
+# - Optional external market filter (Price > SMA)
 # - SMA Trend
 # - Playbook-style SMA + envelope
 # - Daily / Weekly / Monthly signals
@@ -592,6 +593,32 @@ def generate_signals(
 
     raise ValueError("Unknown strategy.")
 
+def apply_market_filter(
+    signals: pd.Series,
+    prices: pd.DataFrame,
+    filter_asset: Optional[str],
+    rule: str,
+    sma_days: int,
+) -> pd.Series:
+    """Force underlying strategy signals to CASH when an external filter fails."""
+    if filter_asset is None or filter_asset == "None":
+        return signals.copy()
+    if rule != "Price > SMA":
+        raise ValueError(f"Unsupported market filter rule: {rule}")
+    if filter_asset not in prices.columns:
+        raise ValueError(f"Market filter asset is unavailable: {filter_asset}")
+
+    filtered = signals.copy()
+    filter_series = prices[filter_asset]
+    for dt in filtered.index:
+        # Both values use observations on or before the decision date. If there
+        # is not yet enough history for the SMA, stay in cash.
+        sma = sma_value(filter_series, dt, sma_days)
+        px = last_price_on_or_before(prices[[filter_asset]], dt)[filter_asset]
+        if pd.isna(sma) or not (px > sma):
+            filtered.loc[dt] = "CASH"
+    return filtered
+
 # ---------- 11. EXECUTION DATE ----------
 def next_available_date(index: pd.DatetimeIndex, signal_dt: pd.Timestamp, mode: str):
     pos = index.searchsorted(signal_dt)
@@ -769,12 +796,21 @@ def run_test(
     initial_value=100000,
     start_date=None,
     end_date=None,
+    market_filter_asset=None,
+    market_filter_rule="Price > SMA",
 ):
     names = [primary]
     if secondary and secondary != "None" and secondary not in names:
         names.append(secondary)
     if benchmark_asset and benchmark_asset != "None" and benchmark_asset not in names:
         names.append(benchmark_asset)
+
+    # Preserve the original signal universe. The external filter can be any
+    # loaded dataset and must never become a tradable candidate itself.
+    signal_names = list(names)
+    filter_asset = None if market_filter_asset in (None, "None") else market_filter_asset
+    if filter_asset and filter_asset not in names:
+        names.append(filter_asset)
 
     prices = aligned_prices(names, base_currency)
     start = pd.Timestamp(start_date).normalize() if start_date is not None else None
@@ -788,7 +824,7 @@ def run_test(
         raise ValueError("Choose a date range containing at least two available trading days.")
 
     signals = generate_signals(
-        prices=history,
+        prices=history[signal_names],
         strategy=strategy,
         primary=primary,
         secondary=None if secondary=="None" else secondary,
@@ -796,6 +832,13 @@ def run_test(
         lookback_months=lookback_months,
         sma_days=sma_days,
         envelope_pct=envelope_pct,
+    )
+    signals = apply_market_filter(
+        signals=signals,
+        prices=history,
+        filter_asset=filter_asset,
+        rule=market_filter_rule,
+        sma_days=sma_days,
     )
 
     # Carry the latest known target into the first available test close.
@@ -838,6 +881,9 @@ def run_test(
         "benchmark": bench,
         "benchmark_metrics": bench_metrics,
         "cash_rate": cash_rate,
+        "market_filter_asset": filter_asset,
+        "market_filter_rule": market_filter_rule if filter_asset else None,
+        "market_filter_sma_days": sma_days if filter_asset else None,
     }
 
 # ---------- 16. DISPLAY ----------
@@ -872,6 +918,15 @@ def show_result(result, benchmark_label=None):
     if result["benchmark_metrics"] is not None:
         table[benchmark_label or "Benchmark"] = formatted_metrics(result["benchmark_metrics"])
     display(pd.DataFrame(table))
+
+    if result.get("market_filter_asset"):
+        print(
+            f"\nMarket filter: {result['market_filter_asset']} — "
+            f"{result['market_filter_rule']} ({result['market_filter_sma_days']}-day SMA). "
+            "When the rule is false or the SMA is unavailable, the strategy holds CASH."
+        )
+    else:
+        print("\nMarket filter: None")
 
     print(
         f"\nAnnual cash return while the strategy holds CASH: "
@@ -927,6 +982,9 @@ def batch_momentum_test(
     tx_cost=0.001,
     cash_rate=0.0,
     execution_mode="Next available close",
+    sma_days=200,
+    market_filter_asset=None,
+    market_filter_rule="Price > SMA",
 ):
     rows = []
     for secondary in secondary_options:
@@ -944,6 +1002,9 @@ def batch_momentum_test(
                     cash_rate=cash_rate,
                     execution_mode=execution_mode,
                     benchmark_asset=primary,
+                    sma_days=sma_days,
+                    market_filter_asset=market_filter_asset,
+                    market_filter_rule=market_filter_rule,
                 )
                 m = r["metrics"]
                 rows.append({
@@ -985,6 +1046,10 @@ strategy_dd = widgets.Dropdown(
 primary_dd = widgets.Dropdown(options=[""], description="Primary:")
 secondary_dd = widgets.Dropdown(options=["None"], description="Second:")
 benchmark_dd = widgets.Dropdown(options=["None"], description="Benchmark:")
+market_filter_asset_dd = widgets.Dropdown(options=["None"], value="None", description="Market filter:")
+market_filter_rule_dd = widgets.Dropdown(
+    options=["Price > SMA"], value="Price > SMA", description="Filter rule:"
+)
 
 base_dd = widgets.Dropdown(options=["USD","ILS"], value="USD", description="Base:")
 freq_dd = widgets.Dropdown(options=["Daily","Weekly","Monthly"], value="Monthly", description="Signal:")
@@ -995,7 +1060,7 @@ execution_dd = widgets.Dropdown(
 )
 
 lookback_slider = widgets.IntSlider(value=12, min=1, max=24, step=1, description="ROC months:")
-sma_slider = widgets.IntSlider(value=200, min=20, max=300, step=5, description="SMA days:")
+sma_slider = widgets.IntSlider(value=200, min=20, max=300, step=1, description="SMA days:")
 envelope_slider = widgets.FloatSlider(value=5.0, min=0.0, max=15.0, step=0.5, description="Envelope %:")
 
 tax_box = widgets.FloatText(value=25.0, description="Tax %:")
@@ -1040,10 +1105,13 @@ def _download_online_clicked(_):
 online_download_btn.on_click(_download_online_clicked)
 
 def refresh_strategy_dropdowns():
+    selected_filter = market_filter_asset_dd.value
     opts = list(ASSETS.keys())
     primary_dd.options = opts if opts else [""]
     secondary_dd.options = ["None"] + opts
     benchmark_dd.options = ["None"] + opts
+    market_filter_asset_dd.options = ["None"] + opts
+    market_filter_asset_dd.value = selected_filter if selected_filter in opts else "None"
     if opts:
         primary_dd.value = opts[0]
 
@@ -1072,6 +1140,8 @@ def _run_clicked(_):
                 initial_value=initial_box.value,
                 start_date=start_date_picker.value,
                 end_date=end_date_picker.value,
+                market_filter_asset=market_filter_asset_dd.value,
+                market_filter_rule=market_filter_rule_dd.value,
             )
             show_result(result, benchmark_dd.value)
         except Exception as e:
@@ -1143,6 +1213,8 @@ def launch_backtester():
     display(widgets.VBox([
         widgets.HBox([strategy_dd, primary_dd, secondary_dd]),
         widgets.HBox([benchmark_dd, base_dd, freq_dd, execution_dd]),
+        widgets.HBox([market_filter_asset_dd, market_filter_rule_dd]),
+        widgets.HTML("The market filter uses the SMA days setting below and forces CASH when the selected asset is not above its SMA."),
         widgets.HBox([start_date_picker, end_date_picker]),
         widgets.HTML("Leave dates blank for the full available history. Earlier data is used for indicators; "
                      "the latest earlier signal sets the position at the first available close. "
