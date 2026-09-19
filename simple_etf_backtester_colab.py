@@ -25,7 +25,7 @@
 # - User-set annual return while the strategy is in cash
 # - Benchmark comparison
 # - AGITQ audit export with daily state, events, trades, settings, and metrics
-# - CAGR, max drawdown, volatility, Sharpe, trades, allocation
+# - Cash-flow-adjusted return, XIRR, max drawdown, volatility, Sharpe, trades, allocation
 #
 # IMPORTANT:
 # This is a ballpark backtester. It prioritizes consistency and transparency.
@@ -34,7 +34,7 @@
 # ============================================================
 
 # ---------- 1. INSTALL / IMPORT ----------
-import sys, subprocess, pkgutil, io, math, warnings, json, zipfile, tempfile
+import sys, subprocess, pkgutil, io, math, warnings, json, zipfile, tempfile, os, sqlite3, re
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Dict, Optional, List, Tuple
@@ -126,6 +126,13 @@ class AssetData:
 ASSETS: Dict[str, AssetData] = {}
 FX_SERIES: Optional[pd.Series] = None   # interpreted as ILS per 1 USD
 FX_NAME: Optional[str] = None
+
+# Stored beside the notebook/script by default. Set ETF_BACKTESTER_RESULTS_DB to
+# an absolute path (for example, in Google Drive) when a different location is wanted.
+RESULTS_DB_PATH = os.environ.get(
+    "ETF_BACKTESTER_RESULTS_DB",
+    os.path.abspath("simple_etf_backtester_results.sqlite"),
+)
 
 # ---------- 4. FILE IMPORT HELPERS ----------
 def _read_csv_bytes(content: bytes) -> pd.DataFrame:
@@ -1038,6 +1045,7 @@ def backtest_agitq(
     trades = []
     events = []
     equity = pd.Series(index=idx, dtype=float)
+    external_flows = pd.Series(0.0, index=idx, dtype=float)
     holding_hist = pd.Series(index=idx, dtype="object")
 
     def portfolio_value(dt):
@@ -1162,6 +1170,7 @@ def backtest_agitq(
         for contribution_dt, row in contribution_exec.get(dt, []):
             cash += contribution_amount
             total_contributions += contribution_amount
+            external_flows.loc[dt] += contribution_amount
             target = row["new_capital_target"]
             if row["confirmed_signal"] == "OFF":
                 reason = f"AGITQ OFF: new contribution → {defensive_asset}"
@@ -1191,26 +1200,97 @@ def backtest_agitq(
         holding_hist.dropna(),
         pd.DataFrame(events),
         total_contributions,
+        external_flows,
     )
 
 # ---------- 13. METRICS ----------
-def calculate_metrics(equity: pd.Series, trades: pd.DataFrame, holdings: pd.Series):
+def _cash_flow_adjusted_returns(
+    equity: pd.Series,
+    external_flows: Optional[pd.Series] = None,
+) -> pd.Series:
+    """Return series with end-of-day external deposits removed from performance."""
+    flows = pd.Series(0.0, index=equity.index, dtype=float)
+    if external_flows is not None:
+        flows = external_flows.reindex(equity.index, fill_value=0.0).astype(float)
+    previous_value = equity.shift(1)
+    returns = (equity - flows) / previous_value - 1
+    return returns.replace([np.inf, -np.inf], np.nan).dropna()
+
+def _xirr(cash_flows: pd.Series) -> float:
+    """Annualized money-weighted return for conventional dated cash flows."""
+    flows = cash_flows.groupby(level=0).sum().sort_index()
+    flows = flows[flows != 0]
+    if len(flows) < 2 or not (flows.lt(0).any() and flows.gt(0).any()):
+        return np.nan
+
+    origin = flows.index[0]
+    year_fractions = np.array((flows.index - origin).days, dtype=float) / 365.25
+    amounts = flows.to_numpy(dtype=float)
+
+    def npv(rate):
+        return float(np.sum(amounts / np.power(1.0 + rate, year_fractions)))
+
+    low, high = -0.999999, 1.0
+    low_value, high_value = npv(low), npv(high)
+    while np.sign(low_value) == np.sign(high_value) and high < 1e9:
+        high *= 2.0
+        high_value = npv(high)
+    if not np.isfinite(low_value) or not np.isfinite(high_value):
+        return np.nan
+    if np.sign(low_value) == np.sign(high_value):
+        return np.nan
+
+    for _ in range(200):
+        midpoint = (low + high) / 2.0
+        mid_value = npv(midpoint)
+        if abs(mid_value) < 1e-10:
+            return midpoint
+        if np.sign(mid_value) == np.sign(low_value):
+            low, low_value = midpoint, mid_value
+        else:
+            high, high_value = midpoint, mid_value
+    return (low + high) / 2.0
+
+def calculate_metrics(
+    equity: pd.Series,
+    trades: pd.DataFrame,
+    holdings: pd.Series,
+    external_flows: Optional[pd.Series] = None,
+    initial_value: Optional[float] = None,
+):
     if len(equity) < 2:
         raise ValueError("Not enough equity data.")
 
-    years = (equity.index[-1] - equity.index[0]).days / 365.25
-    cagr = (equity.iloc[-1] / equity.iloc[0]) ** (1 / years) - 1 if years > 0 else np.nan
+    flows = pd.Series(0.0, index=equity.index, dtype=float)
+    if external_flows is not None:
+        flows = external_flows.reindex(equity.index, fill_value=0.0).astype(float)
 
-    daily_ret = equity.pct_change().dropna()
+    years = (equity.index[-1] - equity.index[0]).days / 365.25
+    daily_ret = _cash_flow_adjusted_returns(equity, flows)
+    performance_index = pd.Series(1.0, index=equity.index, dtype=float)
+    if not daily_ret.empty:
+        performance_index.loc[daily_ret.index] = (1 + daily_ret).cumprod()
+        performance_index = performance_index.ffill()
+    cagr = performance_index.iloc[-1] ** (1 / years) - 1 if years > 0 else np.nan
+
     vol = daily_ret.std() * np.sqrt(252)
     sharpe = (daily_ret.mean() / daily_ret.std()) * np.sqrt(252) if daily_ret.std() > 0 else np.nan
 
-    peak = equity.cummax()
-    dd = equity / peak - 1
+    peak = performance_index.cummax()
+    dd = performance_index / peak - 1
     max_dd = dd.min()
 
-    annual = equity.resample("YE").last().pct_change().dropna()
+    annual = performance_index.resample("YE").last().pct_change().dropna()
     worst_year = annual.min() if not annual.empty else np.nan
+
+    starting_capital = float(equity.iloc[0] if initial_value is None else initial_value)
+    periodic_contributions = float(flows.sum())
+    total_invested = starting_capital + periodic_contributions
+    net_profit = float(equity.iloc[-1] - total_invested)
+    investor_cash_flows = -flows.copy()
+    investor_cash_flows.loc[equity.index[0]] -= starting_capital
+    investor_cash_flows.loc[equity.index[-1]] += float(equity.iloc[-1])
+    money_weighted_return = _xirr(investor_cash_flows)
 
     # Every executed BUY or SELL is one trade.
     trade_count = int(len(trades)) if not trades.empty else 0
@@ -1219,22 +1299,44 @@ def calculate_metrics(equity: pd.Series, trades: pd.DataFrame, holdings: pd.Seri
 
     return {
         "CAGR": cagr,
+        "Money-Weighted Return": money_weighted_return,
         "Max Drawdown": max_dd,
         "Volatility": vol,
         "Sharpe": sharpe,
         "Final Value": equity.iloc[-1],
+        "Initial Capital": starting_capital,
+        "Periodic Contributions": periodic_contributions,
+        "Total Invested": total_invested,
+        "Net Profit": net_profit,
         "Trades": trade_count,
         "Worst Year": worst_year,
         "Start": equity.index[0],
         "End": equity.index[-1],
         "Allocation": alloc,
         "DrawdownSeries": dd,
+        "ReturnSeries": daily_ret,
+        "PerformanceIndex": performance_index,
     }
 
 # ---------- 14. BENCHMARK ----------
-def benchmark_buyhold(prices: pd.DataFrame, asset: str, initial_value=100000):
+def benchmark_buyhold(
+    prices: pd.DataFrame,
+    asset: str,
+    initial_value=100000,
+    external_flows: Optional[pd.Series] = None,
+):
     s = prices[asset].dropna()
-    return initial_value * (s / s.iloc[0])
+    flows = pd.Series(0.0, index=s.index, dtype=float)
+    if external_flows is not None:
+        flows = external_flows.reindex(s.index, fill_value=0.0).astype(float)
+    units = float(initial_value) / s.iloc[0]
+    values = pd.Series(index=s.index, dtype=float)
+    for dt, price in s.items():
+        contribution = flows.loc[dt]
+        if contribution > 0:
+            units += contribution / price
+        values.loc[dt] = units * price
+    return values
 
 # ---------- 15. RUN ONE TEST ----------
 def run_test(
@@ -1319,7 +1421,9 @@ def run_test(
         execution_mode=execution_mode,
     )
 
-    metrics = calculate_metrics(equity, trades, holdings)
+    metrics = calculate_metrics(
+        equity, trades, holdings, initial_value=initial_value
+    )
 
     bench = None
     bench_metrics = None
@@ -1327,9 +1431,36 @@ def run_test(
         bench = benchmark_buyhold(prices.loc[equity.index.min():equity.index.max()], benchmark_asset, initial_value)
         # Align to equity
         bench = bench.reindex(equity.index).ffill().dropna()
-        bench_metrics = calculate_metrics(bench, pd.DataFrame(), pd.Series("BENCH", index=bench.index))
+        bench_metrics = calculate_metrics(
+            bench,
+            pd.DataFrame(),
+            pd.Series("BENCH", index=bench.index),
+            initial_value=initial_value,
+        )
         # A buy-and-hold benchmark makes one opening purchase and no sale.
         bench_metrics["Trades"] = 1
+
+    settings = {
+        "Strategy": strategy,
+        "Primary asset": primary,
+        "Secondary asset": secondary if secondary not in (None, "None") else None,
+        "Benchmark asset": benchmark_asset if benchmark_asset not in (None, "None") else None,
+        "Base currency": base_currency,
+        "Signal frequency": frequency,
+        "ROC months": lookback_months,
+        "SMA days": sma_days,
+        "Envelope %": envelope_pct * 100,
+        "Tax %": tax_rate * 100,
+        "Transaction cost %": tx_cost * 100,
+        "Annual cash return %": cash_rate * 100,
+        "Execution": execution_mode,
+        "Initial capital": initial_value,
+        "Market filter asset": filter_asset,
+        "Market filter rule": market_filter_rule if filter_asset else None,
+        "Market filter evaluation frequency": (
+            market_filter_evaluation_frequency if filter_asset else None
+        ),
+    }
 
     return {
         "prices": prices,
@@ -1340,6 +1471,10 @@ def run_test(
         "metrics": metrics,
         "benchmark": bench,
         "benchmark_metrics": bench_metrics,
+        "external_flows": pd.Series(0.0, index=equity.index, dtype=float),
+        "initial_value": initial_value,
+        "total_contributions": 0.0,
+        "settings": settings,
         "cash_rate": cash_rate,
         "market_filter_asset": filter_asset,
         "market_filter_rule": market_filter_rule if filter_asset else None,
@@ -1419,7 +1554,7 @@ def run_agitq_test(
         envelope_enabled=envelope_enabled,
         confirmation_days=confirmation_days,
     )
-    equity, trades, holdings, events, total_contributions = backtest_agitq(
+    equity, trades, holdings, events, total_contributions, external_flows = backtest_agitq(
         prices=prices,
         state_history=agitq_state,
         traded_asset=traded_asset,
@@ -1433,17 +1568,34 @@ def run_agitq_test(
         contribution_amount=contribution_amount,
         contribution_frequency=contribution_frequency,
     )
-    metrics = calculate_metrics(equity, trades, holdings)
+    metrics = calculate_metrics(
+        equity,
+        trades,
+        holdings,
+        external_flows=external_flows,
+        initial_value=initial_value,
+    )
 
     bench = None
     bench_metrics = None
     if benchmark_asset and benchmark_asset != "None":
         bench = benchmark_buyhold(
-            prices.loc[equity.index.min():equity.index.max()], benchmark_asset, initial_value
+            prices.loc[equity.index.min():equity.index.max()],
+            benchmark_asset,
+            initial_value,
+            external_flows=external_flows,
         )
         bench = bench.reindex(equity.index).ffill().dropna()
-        bench_metrics = calculate_metrics(bench, pd.DataFrame(), pd.Series("BENCH", index=bench.index))
-        bench_metrics["Trades"] = 1
+        bench_flows = external_flows.reindex(bench.index, fill_value=0.0)
+        bench_metrics = calculate_metrics(
+            bench,
+            pd.DataFrame(),
+            pd.Series("BENCH", index=bench.index),
+            external_flows=bench_flows,
+            initial_value=initial_value,
+        )
+        # Opening purchase plus each contribution that buys more benchmark shares.
+        bench_metrics["Trades"] = int(initial_value > 0) + int((bench_flows > 0).sum())
 
     settings = {
         "Strategy": AGITQ_STRATEGY_NAME,
@@ -1462,7 +1614,13 @@ def run_agitq_test(
         "Partial profit-taking": "OFF — unavailable" if not partial_profit_taking else "ON",
         "Contribution amount": contribution_amount,
         "Contribution frequency": contribution_frequency,
+        "Initial capital": initial_value,
+        "Tax %": tax_rate * 100,
+        "Transaction cost %": tx_cost * 100,
+        "Annual cash return %": cash_rate * 100,
         "Execution": "Next available close",
+        "Base currency": base_currency,
+        "Benchmark asset": benchmark_asset if benchmark_asset not in (None, "None") else None,
     }
     audit_state = agitq_state.loc[prices.index.min():prices.index.max()].copy()
     audit_state["actual_holding"] = holdings.reindex(audit_state.index).ffill()
@@ -1480,6 +1638,8 @@ def run_agitq_test(
         "agitq_state": audit_state,
         "agitq_events": events,
         "total_contributions": total_contributions,
+        "external_flows": external_flows,
+        "initial_value": initial_value,
     }
 
 # ---------- 16. DISPLAY ----------
@@ -1491,14 +1651,20 @@ def money(x):
 
 def show_result(result, benchmark_label=None):
     m = result["metrics"]
+    has_contributions = m.get("Periodic Contributions", 0) > 0
 
     def formatted_metrics(metrics):
         return [
             pct(metrics["CAGR"]),
+            pct(metrics["Money-Weighted Return"]),
             pct(metrics["Max Drawdown"]),
             pct(metrics["Volatility"]),
             "—" if pd.isna(metrics["Sharpe"]) else f"{metrics['Sharpe']:.2f}",
+            money(metrics["Initial Capital"]),
+            money(metrics["Periodic Contributions"]),
+            money(metrics["Total Invested"]),
             money(metrics["Final Value"]),
+            money(metrics["Net Profit"]),
             str(metrics["Trades"]),
             pct(metrics["Worst Year"]),
             f"{metrics['Start'].date()} → {metrics['End'].date()}",
@@ -1506,8 +1672,11 @@ def show_result(result, benchmark_label=None):
 
     table = {
         "Metric": [
-            "CAGR", "Max drawdown", "Volatility", "Sharpe",
-            "Final value", "Trades", "Worst year", "Period",
+            "Annual return (TWR)" if has_contributions else "CAGR",
+            "Money-weighted return (XIRR)",
+            "Max drawdown", "Volatility", "Sharpe",
+            "Initial capital", "Periodic contributions", "Total invested",
+            "Final value", "Net profit", "Trades", "Worst year", "Period",
         ],
         "Strategy": formatted_metrics(m),
     }
@@ -1523,7 +1692,7 @@ def show_result(result, benchmark_label=None):
         if result.get("total_contributions", 0) > 0:
             print(
                 f"Total periodic contributions: {money(result['total_contributions'])}. "
-                "Existing performance calculations are retained and therefore include deposited capital."
+                "TWR statistics remove deposits from investment performance; XIRR reflects their actual timing."
             )
     elif result.get("market_filter_asset"):
         print(
@@ -1547,13 +1716,12 @@ def show_result(result, benchmark_label=None):
     display(alloc)
 
     plt.figure(figsize=(11,5))
-    normalized = result["equity"] / result["equity"].iloc[0] * 100
+    normalized = m["PerformanceIndex"] * 100
     plt.plot(normalized.index, normalized.values, label="Strategy")
     if result["benchmark"] is not None:
-        b = result["benchmark"]
-        b = b / b.iloc[0] * 100
+        b = result["benchmark_metrics"]["PerformanceIndex"] * 100
         plt.plot(b.index, b.values, label=benchmark_label or "Benchmark")
-    plt.title("Growth of 100")
+    plt.title("Time-weighted growth of 100" if has_contributions else "Growth of 100")
     plt.ylabel("Value")
     plt.legend()
     plt.grid(alpha=0.2)
@@ -1610,9 +1778,17 @@ def export_agitq_result(result):
     result["trades"].to_csv(f"{export_dir}/agitq_trades.csv", index=False)
     result["agitq_events"].to_csv(f"{export_dir}/agitq_events.csv", index=False)
     result["equity"].rename("equity").to_csv(f"{export_dir}/agitq_equity.csv", index_label="date")
+    pd.DataFrame({
+        "equity": result["equity"],
+        "external_flow": result["external_flows"].reindex(result["equity"].index, fill_value=0.0),
+        "cash_flow_adjusted_return": result["metrics"]["ReturnSeries"],
+        "time_weighted_index": result["metrics"]["PerformanceIndex"],
+    }).to_csv(f"{export_dir}/agitq_performance.csv", index_label="date")
     metrics_export = {
         key: value for key, value in result["metrics"].items()
-        if key not in ("Allocation", "DrawdownSeries")
+        if key not in (
+            "Allocation", "DrawdownSeries", "ReturnSeries", "PerformanceIndex"
+        )
     }
     pd.DataFrame(list(metrics_export.items()), columns=["Metric", "Value"]).to_csv(
         f"{export_dir}/agitq_metrics.csv", index=False
@@ -1621,7 +1797,8 @@ def export_agitq_result(result):
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
         for filename in [
             "agitq_settings.csv", "agitq_daily_state.csv", "agitq_trades.csv",
-            "agitq_events.csv", "agitq_equity.csv", "agitq_metrics.csv",
+            "agitq_events.csv", "agitq_equity.csv", "agitq_performance.csv",
+            "agitq_metrics.csv",
         ]:
             archive.write(f"{export_dir}/{filename}", arcname=filename)
     if IN_COLAB:
@@ -1630,7 +1807,193 @@ def export_agitq_result(result):
         display(FileLink(zip_path))
     return zip_path
 
-# ---------- 17. BATCH TEST ----------
+# ---------- 17. RESULT HISTORY ----------
+RESULT_COLUMNS = {
+    "Saved": "created_at",
+    "Run type": "run_type",
+    "Strategy": "strategy",
+    "Primary asset": "primary_asset",
+    "Secondary asset": "secondary_asset",
+    "Benchmark asset": "benchmark_asset",
+    "CAGR / annual return": "cagr",
+    "Max drawdown": "max_drawdown",
+    "Volatility": "volatility",
+    "Sharpe": "sharpe",
+    "Final value": "final_value",
+    "Trades": "trades",
+    "Worst year": "worst_year",
+    "Period start": "period_start",
+    "Period end": "period_end",
+}
+
+def _json_default(value):
+    if isinstance(value, (pd.Timestamp, datetime, date)):
+        return value.isoformat()
+    if isinstance(value, np.generic):
+        return value.item()
+    return str(value)
+
+def _results_connection():
+    connection = sqlite3.connect(RESULTS_DB_PATH)
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS backtest_results (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            run_type TEXT NOT NULL,
+            strategy TEXT NOT NULL,
+            primary_asset TEXT,
+            secondary_asset TEXT,
+            benchmark_asset TEXT,
+            assets_json TEXT NOT NULL,
+            settings_json TEXT NOT NULL,
+            period_start TEXT NOT NULL,
+            period_end TEXT NOT NULL,
+            cagr REAL,
+            max_drawdown REAL,
+            volatility REAL,
+            sharpe REAL,
+            final_value REAL,
+            trades INTEGER,
+            worst_year REAL
+        )
+    """)
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_results_strategy ON backtest_results(strategy)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_results_period ON backtest_results(period_start, period_end)")
+    connection.commit()
+    return connection
+
+def _result_assets_and_settings(result):
+    settings = dict(result.get("settings") or result.get("agitq_settings") or {})
+    if result.get("agitq_settings"):
+        assets = {
+            "signal": settings.get("Signal asset"),
+            "traded": settings.get("Traded asset"),
+            "defensive": settings.get("Defensive asset"),
+            "parking": settings.get("S&P parking asset"),
+            "benchmark": settings.get("Benchmark asset"),
+        }
+        primary = settings.get("Traded asset")
+        secondary = settings.get("Signal asset")
+    else:
+        assets = {
+            "primary": settings.get("Primary asset"),
+            "secondary": settings.get("Secondary asset"),
+            "benchmark": settings.get("Benchmark asset"),
+            "market_filter": settings.get("Market filter asset"),
+        }
+        primary = settings.get("Primary asset")
+        secondary = settings.get("Secondary asset")
+    assets = {key: value for key, value in assets.items() if value not in (None, "", "None")}
+    return assets, settings, primary, secondary, settings.get("Benchmark asset")
+
+def save_backtest_result(result, run_type="Individual", batch_context=None):
+    """Persist a completed test and its full settings without changing its results."""
+    metrics = result["metrics"]
+    assets, settings, primary, secondary, benchmark = _result_assets_and_settings(result)
+    if batch_context:
+        settings["Batch context"] = batch_context
+    created_at = datetime.now().astimezone().isoformat(timespec="seconds")
+    row = (
+        created_at,
+        run_type,
+        settings.get("Strategy", "Unknown"),
+        primary,
+        secondary,
+        benchmark,
+        json.dumps(assets, default=_json_default, sort_keys=True),
+        json.dumps(settings, default=_json_default, sort_keys=True),
+        str(metrics["Start"].date()),
+        str(metrics["End"].date()),
+        float(metrics["CAGR"]) if pd.notna(metrics["CAGR"]) else None,
+        float(metrics["Max Drawdown"]) if pd.notna(metrics["Max Drawdown"]) else None,
+        float(metrics["Volatility"]) if pd.notna(metrics["Volatility"]) else None,
+        float(metrics["Sharpe"]) if pd.notna(metrics["Sharpe"]) else None,
+        float(metrics["Final Value"]),
+        int(metrics["Trades"]),
+        float(metrics["Worst Year"]) if pd.notna(metrics["Worst Year"]) else None,
+    )
+    with _results_connection() as connection:
+        cursor = connection.execute("""
+            INSERT INTO backtest_results (
+                created_at, run_type, strategy, primary_asset, secondary_asset,
+                benchmark_asset, assets_json, settings_json, period_start, period_end,
+                cagr, max_drawdown, volatility, sharpe, final_value, trades, worst_year
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, row)
+        return cursor.lastrowid
+
+def _parse_numeric_filter(expression, ratio=False):
+    expression = (expression or "").strip()
+    if not expression:
+        return None
+    matched = re.fullmatch(r"(<=|>=|=|<|>)\s*(-?(?:\d+(?:\.\d*)?|\.\d+))\s*(%)?", expression)
+    if not matched:
+        raise ValueError(f"Invalid numeric filter: {expression!r}. Use, for example, > 10% or >= 0.6.")
+    operator, raw_value, percent = matched.groups()
+    value = float(raw_value)
+    if ratio and (percent or abs(value) > 1):
+        value /= 100
+    return operator, value
+
+def load_saved_backtests(
+    strategy=None,
+    asset_text=None,
+    parameter_text=None,
+    start_on_or_after=None,
+    end_on_or_before=None,
+    numeric_filters=None,
+    sort_by="created_at",
+    ascending=False,
+):
+    if sort_by not in RESULT_COLUMNS.values():
+        raise ValueError("Unknown history sort column.")
+    clauses, values = [], []
+    if strategy and strategy != "All strategies":
+        clauses.append("strategy = ?")
+        values.append(strategy)
+    if asset_text and asset_text.strip():
+        clauses.append("assets_json LIKE ?")
+        values.append(f"%{asset_text.strip()}%")
+    if parameter_text and parameter_text.strip():
+        clauses.append("settings_json LIKE ?")
+        values.append(f"%{parameter_text.strip()}%")
+    if start_on_or_after:
+        clauses.append("period_start >= ?")
+        values.append(str(pd.Timestamp(start_on_or_after).date()))
+    if end_on_or_before:
+        clauses.append("period_end <= ?")
+        values.append(str(pd.Timestamp(end_on_or_before).date()))
+    for column, expression in (numeric_filters or {}).items():
+        if column not in {"cagr", "max_drawdown", "volatility", "sharpe", "trades", "final_value", "worst_year"}:
+            raise ValueError(f"Unknown numeric history filter: {column}")
+        parsed = _parse_numeric_filter(expression, ratio=column in {"cagr", "max_drawdown", "volatility", "worst_year"})
+        if parsed:
+            operator, value = parsed
+            clauses.append(f"{column} {operator} ?")
+            values.append(value)
+    where = " WHERE " + " AND ".join(clauses) if clauses else ""
+    order = "ASC" if ascending else "DESC"
+    query = "SELECT * FROM backtest_results" + where + f" ORDER BY {sort_by} {order}, id {order}"
+    with _results_connection() as connection:
+        return pd.read_sql_query(query, connection, params=values)
+
+def delete_saved_backtests(result_ids):
+    ids = [int(value) for value in result_ids]
+    if not ids:
+        return 0
+    placeholders = ", ".join("?" for _ in ids)
+    with _results_connection() as connection:
+        cursor = connection.execute(f"DELETE FROM backtest_results WHERE id IN ({placeholders})", ids)
+        return cursor.rowcount
+
+def saved_result_strategies():
+    with _results_connection() as connection:
+        rows = connection.execute(
+            "SELECT DISTINCT strategy FROM backtest_results ORDER BY strategy"
+        ).fetchall()
+    return [row[0] for row in rows]
+
+# ---------- 18. BATCH TEST ----------
 def batch_momentum_test(
     primary,
     secondary_options,
@@ -1667,6 +2030,14 @@ def batch_momentum_test(
                     market_filter_asset=market_filter_asset,
                     market_filter_rule=market_filter_rule,
                     market_filter_evaluation_frequency=market_filter_evaluation_frequency,
+                )
+                save_backtest_result(
+                    r,
+                    run_type="Batch",
+                    batch_context={
+                        "Secondary asset": secondary,
+                        "ROC months": lb,
+                    },
                 )
                 m = r["metrics"]
                 rows.append({
@@ -1792,6 +2163,186 @@ end_date_picker = widgets.DatePicker(description="End date:")
 
 run_btn = widgets.Button(description="Run backtest", button_style="success")
 result_output = widgets.Output()
+
+history_strategy_dd = widgets.Dropdown(options=["All strategies"], description="Strategy:")
+history_asset_box = widgets.Text(description="Asset contains:", placeholder="QQQ")
+history_parameter_box = widgets.Text(description="Setting contains:", placeholder="SMA days")
+history_start_picker = widgets.DatePicker(description="Start on/after:")
+history_end_picker = widgets.DatePicker(description="End on/before:")
+history_cagr_box = widgets.Text(description="CAGR:", placeholder="> 10%")
+history_drawdown_box = widgets.Text(description="Max DD:", placeholder="> -30%")
+history_sharpe_box = widgets.Text(description="Sharpe:", placeholder="> 0.6")
+history_volatility_box = widgets.Text(description="Volatility:", placeholder="< 20%")
+history_trades_box = widgets.Text(description="Trades:", placeholder="< 20")
+history_final_value_box = widgets.Text(description="Final value:", placeholder="> 100000")
+history_sort_dd = widgets.Dropdown(
+    options=[(label, column) for label, column in RESULT_COLUMNS.items()],
+    value="created_at",
+    description="Sort by:",
+)
+history_ascending_cb = widgets.Checkbox(value=False, description="Ascending")
+history_refresh_btn = widgets.Button(description="Apply filters / refresh", button_style="info")
+history_clear_btn = widgets.Button(description="Clear all filters")
+history_export_filtered_btn = widgets.Button(description="Export filtered CSV")
+history_export_all_btn = widgets.Button(description="Export all CSV")
+history_delete_btn = widgets.Button(description="Delete selected", button_style="danger")
+history_selection = widgets.SelectMultiple(
+    options=[], description="Select results:", layout=widgets.Layout(width="100%", height="130px")
+)
+history_status = widgets.HTML()
+history_output = widgets.Output()
+
+def _history_numeric_filters():
+    return {
+        "cagr": history_cagr_box.value,
+        "max_drawdown": history_drawdown_box.value,
+        "sharpe": history_sharpe_box.value,
+        "volatility": history_volatility_box.value,
+        "trades": history_trades_box.value,
+        "final_value": history_final_value_box.value,
+    }
+
+def _history_query():
+    return load_saved_backtests(
+        strategy=history_strategy_dd.value,
+        asset_text=history_asset_box.value,
+        parameter_text=history_parameter_box.value,
+        start_on_or_after=history_start_picker.value,
+        end_on_or_before=history_end_picker.value,
+        numeric_filters=_history_numeric_filters(),
+        sort_by=history_sort_dd.value,
+        ascending=history_ascending_cb.value,
+    )
+
+def refresh_results_history_controls():
+    current = history_strategy_dd.value
+    options = ["All strategies"] + saved_result_strategies()
+    history_strategy_dd.options = options
+    history_strategy_dd.value = current if current in options else "All strategies"
+
+def _display_history_dataframe(frame):
+    columns = [
+        "id", "created_at", "run_type", "strategy", "primary_asset", "secondary_asset",
+        "benchmark_asset", "period_start", "period_end", "cagr", "max_drawdown",
+        "volatility", "sharpe", "final_value", "trades", "worst_year",
+    ]
+    display_frame = frame.reindex(columns=columns).copy()
+    for column in ["cagr", "max_drawdown", "volatility", "worst_year"]:
+        display_frame[column] = display_frame[column].map(
+            lambda value: "—" if pd.isna(value) else f"{value * 100:.2f}%"
+        )
+    display_frame["sharpe"] = display_frame["sharpe"].map(
+        lambda value: "—" if pd.isna(value) else f"{value:.2f}"
+    )
+    display_frame["final_value"] = display_frame["final_value"].map(
+        lambda value: "—" if pd.isna(value) else f"{value:,.0f}"
+    )
+    display_frame.columns = [
+        "ID", "Saved", "Run type", "Strategy", "Primary", "Secondary", "Benchmark",
+        "Start", "End", "CAGR", "Max DD", "Volatility", "Sharpe", "Final value",
+        "Trades", "Worst year",
+    ]
+    return display_frame
+
+def refresh_results_history(_=None):
+    try:
+        refresh_results_history_controls()
+        frame = _history_query()
+        options = []
+        for row in frame.itertuples(index=False):
+            cagr_text = "—" if pd.isna(row.cagr) else f"{row.cagr * 100:.2f}%"
+            label = (
+                f"#{row.id} | {row.strategy} | {row.primary_asset or '—'} | "
+                f"{row.period_start} → {row.period_end} | CAGR {cagr_text}"
+            )
+            options.append((label, row.id))
+        history_selection.options = options
+        history_selection.value = ()
+        with history_output:
+            clear_output()
+            if frame.empty:
+                print("No saved backtests match the current filters.")
+            else:
+                display(_display_history_dataframe(frame))
+        history_status.value = f"<b>{len(frame)}</b> saved backtest(s) shown."
+        return frame
+    except Exception as exc:
+        history_status.value = f"<span style='color:#b00020'>History error: {exc}</span>"
+        return pd.DataFrame()
+
+def _clear_history_filters(_=None):
+    history_strategy_dd.value = "All strategies"
+    history_asset_box.value = ""
+    history_parameter_box.value = ""
+    history_start_picker.value = None
+    history_end_picker.value = None
+    for widget in [
+        history_cagr_box, history_drawdown_box, history_sharpe_box,
+        history_volatility_box, history_trades_box, history_final_value_box,
+    ]:
+        widget.value = ""
+    history_sort_dd.value = "created_at"
+    history_ascending_cb.value = False
+    refresh_results_history()
+
+def _export_history(frame):
+    if frame.empty:
+        raise ValueError("There are no saved results to export.")
+    export_dir = tempfile.mkdtemp(prefix="backtest_history_")
+    path = os.path.join(export_dir, "backtest_results_history.csv")
+    frame.to_csv(path, index=False)
+    if IN_COLAB:
+        files.download(path)
+    else:
+        display(FileLink(path))
+    return path
+
+def _export_filtered_history(_=None):
+    with history_output:
+        try:
+            _export_history(_history_query())
+        except Exception as exc:
+            print("ERROR:", exc)
+
+def _export_all_history(_=None):
+    with history_output:
+        try:
+            _export_history(load_saved_backtests())
+        except Exception as exc:
+            print("ERROR:", exc)
+
+def _delete_selected_history(_=None):
+    selected = list(history_selection.value)
+    if not selected:
+        history_status.value = "Select one or more saved results to delete."
+        return
+    deleted = delete_saved_backtests(selected)
+    history_status.value = f"Deleted {deleted} saved backtest(s)."
+    refresh_results_history()
+
+history_refresh_btn.on_click(refresh_results_history)
+history_clear_btn.on_click(_clear_history_filters)
+history_export_filtered_btn.on_click(_export_filtered_history)
+history_export_all_btn.on_click(_export_all_history)
+history_delete_btn.on_click(_delete_selected_history)
+
+history_box = widgets.VBox([
+    widgets.HTML(
+        "<h3>Results History</h3><p>Use multiple filters together. Percentage fields accept "
+        "expressions such as <code>&gt; 10%</code> or <code>&gt; -30%</code>.</p>"
+    ),
+    widgets.HBox([history_strategy_dd, history_asset_box, history_parameter_box]),
+    widgets.HBox([history_start_picker, history_end_picker, history_sort_dd, history_ascending_cb]),
+    widgets.HBox([history_cagr_box, history_drawdown_box, history_sharpe_box]),
+    widgets.HBox([history_volatility_box, history_trades_box, history_final_value_box]),
+    widgets.HBox([
+        history_refresh_btn, history_clear_btn, history_export_filtered_btn,
+        history_export_all_btn, history_delete_btn,
+    ]),
+    history_status,
+    history_selection,
+    history_output,
+])
 
 online_ticker_box = widgets.Text(value="", description="Ticker:", placeholder="QQQ")
 online_currency_dd = widgets.Dropdown(options=["USD", "ILS"], value="USD", description="Currency:")
@@ -1932,6 +2483,9 @@ def _run_clicked(_):
                     start_date=start_date_picker.value,
                     end_date=end_date_picker.value,
                 )
+                saved_id = save_backtest_result(result)
+                refresh_results_history_controls()
+                print(f"Saved backtest #{saved_id} to Results History.")
                 show_result(result, benchmark_dd.value)
                 return
 
@@ -1960,6 +2514,9 @@ def _run_clicked(_):
                 market_filter_rule=market_filter_rule_dd.value,
                 market_filter_evaluation_frequency=market_filter_frequency_dd.value,
             )
+            saved_id = save_backtest_result(result)
+            refresh_results_history_controls()
+            print(f"Saved backtest #{saved_id} to Results History.")
             show_result(result, benchmark_dd.value)
         except Exception as e:
             print("ERROR:", e)
@@ -1999,6 +2556,7 @@ fx_btn.on_click(_set_fx)
 def launch_backtester():
     refresh_strategy_dropdowns()
     refresh_fx_dropdown()
+    refresh_results_history_controls()
 
     upload_btn = widgets.Button(description="Upload CSV / Excel", button_style="info", layout=widgets.Layout(width="190px"))
     upload_btn.on_click(lambda _: upload_csvs())
@@ -2044,5 +2602,8 @@ def launch_backtester():
         run_btn,
         result_output
     ]))
+
+    display(history_box)
+    refresh_results_history()
 
 launch_backtester()
