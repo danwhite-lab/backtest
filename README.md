@@ -9,7 +9,7 @@ An interactive Google Colab backtester for ETF and stock strategies.
 - Download adjusted historical ETF or stock prices by Yahoo Finance ticker.
 - Upload CSV, XLSX, or XLS price files as an alternative.
 - Automatically detect common date formats and price columns.
-- Compare buy-and-hold, absolute momentum, dual momentum, relative momentum, SMA trend, and SMA-envelope strategies.
+- Compare buy-and-hold, absolute momentum, dual momentum, relative momentum, SMA trend, and SMA Hysteresis Envelope strategies.
 - Apply an optional external `Price > SMA` market filter using any loaded dataset, including an asset outside the tradable universe.
 - Convert between USD and ILS using an uploaded FX series.
 - Set start and end dates, signal frequency, execution timing, tax, transaction cost, and annual cash return.
