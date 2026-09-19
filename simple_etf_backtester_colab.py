@@ -1087,8 +1087,13 @@ def run_haa_test(strategy, base_currency="USD", initial_value=100000.0, tax_rate
     targets, audit, momentum = generate_haa_targets(history, strategy)
     prices = history.loc[pd.Timestamp(start_date):] if start_date is not None else history
     targets = targets.loc[targets.index <= prices.index.max()]
+    if targets.loc[targets.index <= prices.index.min()].empty:
+        raise ValueError("Canonical HAA needs at least 12 months of pre-start history to establish the initial SPY/BIL/IEF allocation; it will not substitute CASH during warm-up.")
     equity, trades, holdings = backtest_weighted_monthly(prices, targets, initial_value, tax_rate, tx_cost, execution_mode)
-    return {"equity": equity, "trades": trades, "holdings": holdings, "metrics": calculate_metrics(equity, trades, holdings, initial_value=initial_value), "haa_audit": audit, "haa_momentum": momentum, "settings": {"Strategy": strategy, "Execution": execution_mode, "Tax %": tax_rate * 100, "Transaction cost %": tx_cost * 100, "Initial capital": initial_value}, "cash_rate": 0.0, "benchmark": None, "benchmark_metrics": None, "initial_value": initial_value, "total_contributions": 0.0, "external_flows": pd.Series(0.0, index=equity.index)}
+    audit = audit.copy()
+    audit["Execution date"] = [next_available_date(prices.index, dt, execution_mode) for dt in audit["Date"]]
+    adjusted_warning = [asset for asset in assets if "adj" not in (ASSETS[asset].price_col or "").lower()]
+    return {"equity": equity, "trades": trades, "holdings": holdings, "metrics": calculate_metrics(equity, trades, holdings, initial_value=initial_value), "haa_audit": audit, "haa_momentum": momentum, "settings": {"Strategy": strategy, "Execution": execution_mode, "Tax %": tax_rate * 100, "Transaction cost %": tx_cost * 100, "Initial capital": initial_value, "Data warning": ("Non-adjusted price column selected: " + ", ".join(adjusted_warning)) if adjusted_warning else "Adjusted/total-return price columns selected"}, "cash_rate": 0.0, "benchmark": None, "benchmark_metrics": None, "initial_value": initial_value, "total_contributions": 0.0, "external_flows": pd.Series(0.0, index=equity.index)}
 
 # ---------- 11C. CANONICAL GTT SIGNALS ----------
 def download_fred_series(series_id: str) -> pd.Series:
@@ -2577,6 +2582,11 @@ execution_dd = widgets.Dropdown(
     value="Next available close",
     description="Execution:"
 )
+haa_mode_dd = widgets.Dropdown(
+    options=["Canonical replication (same close, 0.1% cost, no tax)", "Realistic implementation (next available close, app tax/cost)"],
+    value="Canonical replication (same close, 0.1% cost, no tax)",
+    description="HAA mode:", style={"description_width": "initial"}, layout=widgets.Layout(width="440px"),
+)
 
 lookback_slider = widgets.IntSlider(value=12, min=1, max=24, step=1, description="ROC months:")
 sma_slider = widgets.IntSlider(value=200, min=20, max=300, step=1, description="SMA days:")
@@ -2946,6 +2956,7 @@ def _strategy_changed(change=None):
     is_haa = strategy_dd.value in (HAA_SIMPLE_STRATEGY_NAME, HAA_BALANCED_STRATEGY_NAME)
     is_gtt = strategy_dd.value == GTT_ORIGINAL_STRATEGY_NAME
     agitq_controls_box.layout.display = "" if is_agitq else "none"
+    haa_mode_dd.layout.display = "" if is_haa else "none"
     market_filter_controls_box.layout.display = "none" if is_agitq else ""
     for widget in [
         primary_dd, secondary_dd, freq_dd, execution_dd,
@@ -3082,10 +3093,11 @@ def _run_clicked(_):
                 display(result["gtt_audit"])
                 return
             if strategy_dd.value in (HAA_SIMPLE_STRATEGY_NAME, HAA_BALANCED_STRATEGY_NAME):
+                canonical = haa_mode_dd.value.startswith("Canonical")
                 result = run_haa_test(
                     strategy=strategy_dd.value, base_currency=base_dd.value,
-                    initial_value=initial_box.value, tax_rate=tax_box.value / 100, tx_cost=fee_box.value / 100,
-                    execution_mode=execution_dd.value, start_date=start_date_picker.value,
+                    initial_value=initial_box.value, tax_rate=0.0 if canonical else tax_box.value / 100, tx_cost=0.001 if canonical else fee_box.value / 100,
+                    execution_mode="Same close" if canonical else "Next available close", start_date=start_date_picker.value,
                     end_date=end_date_picker.value,
                 )
                 show_result(result)
@@ -3222,6 +3234,7 @@ def launch_backtester():
         widgets.HTML("<h3>Backtest</h3>"),
         widgets.HBox([strategy_dd, primary_dd, secondary_dd]),
         widgets.HBox([benchmark_dd, base_dd, freq_dd, execution_dd]),
+        haa_mode_dd,
         market_filter_controls_box,
         agitq_controls_box,
         widgets.HBox([start_date_picker, end_date_picker]),
