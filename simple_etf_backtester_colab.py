@@ -17,12 +17,14 @@
 # - Optional external market filter (Price > SMA)
 # - SMA Trend
 # - SMA Hysteresis Envelope
+# - AGITQ / TQQQ Playbook variants with confirmation and overheat routing
 # - Daily / Weekly / Monthly signals
 # - Same-close or next-available-close execution
 # - Approximate 25% realized capital-gains tax
 # - Transaction costs
 # - User-set annual return while the strategy is in cash
 # - Benchmark comparison
+# - AGITQ audit export with daily state, events, trades, settings, and metrics
 # - CAGR, max drawdown, volatility, Sharpe, trades, allocation
 #
 # IMPORTANT:
@@ -32,7 +34,7 @@
 # ============================================================
 
 # ---------- 1. INSTALL / IMPORT ----------
-import sys, subprocess, pkgutil, io, math, warnings
+import sys, subprocess, pkgutil, io, math, warnings, json, zipfile, tempfile
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Dict, Optional, List, Tuple
@@ -47,7 +49,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import ipywidgets as widgets
 import yfinance as yf
-from IPython.display import display, clear_output
+from IPython.display import display, clear_output, FileLink
 
 warnings.filterwarnings("ignore")
 
@@ -62,6 +64,35 @@ DEFAULT_TAX_RATE = 0.25
 DEFAULT_TRANSACTION_COST = 0.001
 DEFAULT_CASH_RATE = 0.0
 DEFAULT_BASE_CURRENCY = "USD"
+
+AGITQ_STRATEGY_NAME = "AGITQ / TQQQ Playbook"
+AGITQ_PRESETS = {
+    "Original 200": {
+        "signal_asset": "TQQQ", "traded_asset": "TQQQ",
+        "short_sma": None, "long_sma": 200,
+        "entry_sma": None, "exit_sma": None,
+    },
+    "QQQ 3/161": {
+        "signal_asset": "QQQ", "traded_asset": "TQQQ",
+        "short_sma": 3, "long_sma": 161,
+        "entry_sma": None, "exit_sma": None,
+    },
+    "QLD ISA": {
+        "signal_asset": "QQQ", "traded_asset": "QLD",
+        "short_sma": 3, "long_sma": 161,
+        "entry_sma": None, "exit_sma": None,
+    },
+    "TQQQ 5/218": {
+        "signal_asset": "TQQQ", "traded_asset": "TQQQ",
+        "short_sma": 5, "long_sma": 218,
+        "entry_sma": None, "exit_sma": None,
+    },
+    "Hybrid 3/185/161": {
+        "signal_asset": "QQQ", "traded_asset": "TQQQ",
+        "short_sma": 3, "long_sma": None,
+        "entry_sma": 185, "exit_sma": 161,
+    },
+}
 
 DATE_FORMATS = {
     "Auto detect": None,
@@ -660,6 +691,206 @@ def calculate_market_filter_state(
         states.loc[dt] = bool(pd.notna(sma) and px > sma)
     return states
 
+# ---------- 10B. AGITQ SIGNAL MODULE ----------
+def _confirm_agitq_states(raw_states: pd.Series, confirmation_days: int):
+    if confirmation_days not in (0, 2, 3):
+        raise ValueError("Signal confirmation days must be 0, 2, or 3.")
+    required = 1 if confirmation_days == 0 else confirmation_days
+    confirmed = "OFF"
+    pending = None
+    pending_count = 0
+    confirmed_values = []
+    confirmation_labels = []
+    transition_flags = []
+
+    for raw in raw_states:
+        transitioned = False
+        if raw == confirmed:
+            pending = None
+            pending_count = 0
+            label = f"Confirmed {confirmed}"
+        else:
+            if raw == pending:
+                pending_count += 1
+            else:
+                pending = raw
+                pending_count = 1
+            if pending_count >= required:
+                confirmed = raw
+                pending = None
+                pending_count = 0
+                transitioned = True
+                label = f"Confirmed {confirmed}"
+            else:
+                label = f"Pending {raw} {pending_count}/{required}"
+        confirmed_values.append(confirmed)
+        confirmation_labels.append(label)
+        transition_flags.append(transitioned)
+
+    return (
+        pd.Series(confirmed_values, index=raw_states.index, dtype="object"),
+        pd.Series(confirmation_labels, index=raw_states.index, dtype="object"),
+        pd.Series(transition_flags, index=raw_states.index, dtype="bool"),
+    )
+
+def _hybrid_raw_states(
+    short_sma: pd.Series,
+    entry_sma: pd.Series,
+    exit_sma: pd.Series,
+) -> pd.Series:
+    state = "OFF"
+    output = []
+    prev_short = np.nan
+    prev_entry = np.nan
+    prev_exit = np.nan
+
+    for dt in short_sma.index:
+        short = short_sma.loc[dt]
+        entry = entry_sma.loc[dt]
+        exit_ = exit_sma.loc[dt]
+        ready = pd.notna(short) and pd.notna(entry) and pd.notna(exit_)
+        prev_ready = pd.notna(prev_short) and pd.notna(prev_entry) and pd.notna(prev_exit)
+
+        if ready:
+            if state == "OFF":
+                crossed_entry = prev_ready and prev_short <= prev_entry and short > entry
+                between_now = entry <= short <= exit_ if exit_ > entry else False
+                between_before = (
+                    prev_entry <= prev_short <= prev_exit
+                    if prev_ready and prev_exit > prev_entry else False
+                )
+                if exit_ > entry and between_now and not between_before:
+                    state = "EXCEPTION"
+                elif crossed_entry:
+                    state = "NORMAL"
+            elif state == "NORMAL":
+                if short < exit_:
+                    state = "OFF"
+            elif state == "EXCEPTION":
+                if short < entry:
+                    state = "OFF"
+                elif short > exit_:
+                    state = "NORMAL"
+
+        output.append(state)
+        prev_short, prev_entry, prev_exit = short, entry, exit_
+
+    return pd.Series(output, index=short_sma.index, dtype="object", name="raw_hold_state")
+
+def generate_agitq_state(
+    prices: pd.DataFrame,
+    variant: str,
+    signal_asset: str,
+    traded_asset: str,
+    defensive_asset: str,
+    parking_asset: str,
+    short_sma_days: Optional[int],
+    long_sma_days: Optional[int],
+    hybrid_entry_sma_days: Optional[int],
+    hybrid_exit_sma_days: Optional[int],
+    envelope_pct: float,
+    envelope_enabled: bool,
+    confirmation_days: int,
+) -> pd.DataFrame:
+    if variant not in AGITQ_PRESETS:
+        raise ValueError(f"Unknown AGITQ variant: {variant}")
+    if signal_asset not in prices.columns:
+        raise ValueError(f"AGITQ signal asset is unavailable: {signal_asset}")
+
+    signal_price = prices[signal_asset]
+    state = pd.DataFrame(index=prices.index)
+    state["price"] = signal_price
+
+    if variant == "Original 200":
+        if not long_sma_days or long_sma_days < 1:
+            raise ValueError("Original 200 requires a positive long SMA.")
+        state["long_sma"] = signal_price.rolling(long_sma_days, min_periods=long_sma_days).mean()
+        raw = pd.Series("OFF", index=prices.index, dtype="object")
+        prior = "OFF"
+        for dt in prices.index:
+            px, long_value = state.at[dt, "price"], state.at[dt, "long_sma"]
+            if pd.notna(long_value):
+                if px > long_value:
+                    prior = "ON"
+                elif px < long_value:
+                    prior = "OFF"
+            raw.loc[dt] = prior
+        reference = state["long_sma"]
+        raw_hold = raw.map({"ON": "NORMAL", "OFF": "OFF"})
+
+    elif variant in ("QQQ 3/161", "QLD ISA", "TQQQ 5/218"):
+        if not short_sma_days or not long_sma_days:
+            raise ValueError(f"{variant} requires positive short and long SMAs.")
+        state["short_sma"] = signal_price.rolling(short_sma_days, min_periods=short_sma_days).mean()
+        state["long_sma"] = signal_price.rolling(long_sma_days, min_periods=long_sma_days).mean()
+        raw = pd.Series("OFF", index=prices.index, dtype="object")
+        prior = "OFF"
+        for dt in prices.index:
+            short_value = state.at[dt, "short_sma"]
+            long_value = state.at[dt, "long_sma"]
+            if pd.notna(short_value) and pd.notna(long_value):
+                if short_value > long_value:
+                    prior = "ON"
+                elif short_value < long_value:
+                    prior = "OFF"
+            raw.loc[dt] = prior
+        reference = state["long_sma"]
+        raw_hold = raw.map({"ON": "NORMAL", "OFF": "OFF"})
+
+    else:
+        if not short_sma_days or not hybrid_entry_sma_days or not hybrid_exit_sma_days:
+            raise ValueError("Hybrid 3/185/161 requires positive short, entry, and exit SMAs.")
+        state["short_sma"] = signal_price.rolling(short_sma_days, min_periods=short_sma_days).mean()
+        state["entry_sma"] = signal_price.rolling(
+            hybrid_entry_sma_days, min_periods=hybrid_entry_sma_days
+        ).mean()
+        state["exit_sma"] = signal_price.rolling(
+            hybrid_exit_sma_days, min_periods=hybrid_exit_sma_days
+        ).mean()
+        raw_hold = _hybrid_raw_states(state["short_sma"], state["entry_sma"], state["exit_sma"])
+        raw = raw_hold.map(lambda value: "OFF" if value == "OFF" else "ON")
+        reference = state["entry_sma"]
+
+    confirmed_hold, confirmation_state, transitioned = _confirm_agitq_states(
+        raw_hold, confirmation_days
+    )
+    state["reference_sma"] = reference
+    state["upper_envelope"] = reference * (1 + envelope_pct)
+    state["temperature"] = "Unavailable"
+    ready = reference.notna()
+    state.loc[ready & (signal_price < reference), "temperature"] = "Falling"
+    state.loc[
+        ready & (signal_price >= reference) & (signal_price <= state["upper_envelope"]),
+        "temperature",
+    ] = "Focus"
+    state.loc[ready & (signal_price > state["upper_envelope"]), "temperature"] = "Overheated"
+    state["raw_strategy_signal"] = raw
+    state["raw_hold_state"] = raw_hold
+    state["confirmed_hold_state"] = confirmed_hold
+    state["confirmed_signal"] = confirmed_hold.map(
+        lambda value: "OFF" if value == "OFF" else "ON"
+    )
+    state["confirmation_state"] = confirmation_state
+    state["confirmation_completed"] = transitioned
+
+    def allocation_for(row):
+        if row["confirmed_signal"] == "OFF":
+            return defensive_asset
+        if envelope_enabled and row["temperature"] == "Overheated":
+            return parking_asset
+        return traded_asset
+
+    state["new_capital_target"] = state.apply(allocation_for, axis=1)
+    state["final_allocation_action"] = state.apply(
+        lambda row: (
+            f"OFF → {defensive_asset}"
+            if row["confirmed_signal"] == "OFF"
+            else f"ON; new capital → {row['new_capital_target']}"
+        ),
+        axis=1,
+    )
+    return state
+
 # ---------- 11. EXECUTION DATE ----------
 def next_available_date(index: pd.DatetimeIndex, signal_dt: pd.Timestamp, mode: str):
     pos = index.searchsorted(signal_dt)
@@ -775,6 +1006,192 @@ def backtest(
 
     trades_df = pd.DataFrame(trades)
     return equity.dropna(), trades_df, holding_hist.dropna()
+
+def backtest_agitq(
+    prices: pd.DataFrame,
+    state_history: pd.DataFrame,
+    traded_asset: str,
+    defensive_asset: str,
+    parking_asset: str,
+    initial_value: float = 100000.0,
+    tax_rate: float = DEFAULT_TAX_RATE,
+    tx_cost: float = DEFAULT_TRANSACTION_COST,
+    cash_rate: float = DEFAULT_CASH_RATE,
+    confirmation_days: int = 0,
+    contribution_amount: float = 0.0,
+    contribution_frequency: str = "Monthly",
+):
+    """AGITQ-only multi-position accounting using the existing tax/cost conventions."""
+    idx = prices.index
+    if idx.empty:
+        raise ValueError("No AGITQ prices are available in the selected period.")
+    if contribution_amount < 0:
+        raise ValueError("Contribution amount cannot be negative.")
+
+    position_assets = [a for a in {traded_asset, defensive_asset, parking_asset} if a != "CASH"]
+    missing = [a for a in position_assets if a not in prices.columns]
+    if missing:
+        raise ValueError(f"Missing AGITQ price data: {', '.join(missing)}")
+
+    positions = {asset: {"units": 0.0, "cost_basis": 0.0} for asset in position_assets}
+    cash = float(initial_value)
+    trades = []
+    events = []
+    equity = pd.Series(index=idx, dtype=float)
+    holding_hist = pd.Series(index=idx, dtype="object")
+
+    def portfolio_value(dt):
+        return cash + sum(
+            position["units"] * prices.loc[dt, asset]
+            for asset, position in positions.items()
+        )
+
+    def sell_all(asset, dt, reason):
+        nonlocal cash
+        if asset == "CASH" or asset not in positions or positions[asset]["units"] <= 0:
+            return
+        position = positions[asset]
+        sell_px = prices.loc[dt, asset]
+        gross = position["units"] * sell_px
+        proceeds = gross * (1 - tx_cost)
+        gain = proceeds - position["cost_basis"]
+        tax = max(gain, 0) * tax_rate
+        sold_units = position["units"]
+        cash += proceeds - tax
+        position["units"] = 0.0
+        position["cost_basis"] = 0.0
+        trades.append({
+            "date": dt, "action": "SELL", "asset": asset,
+            "price": sell_px, "units": sold_units, "tax": tax,
+            "value": portfolio_value(dt), "reason": reason,
+        })
+
+    def buy_amount(asset, amount, dt, reason):
+        nonlocal cash
+        amount = min(float(amount), cash)
+        if amount <= 0 or asset == "CASH":
+            return
+        buy_px = prices.loc[dt, asset]
+        investable = amount * (1 - tx_cost)
+        bought_units = investable / buy_px
+        cash -= amount
+        positions[asset]["units"] += bought_units
+        positions[asset]["cost_basis"] += investable
+        trades.append({
+            "date": dt, "action": "BUY", "asset": asset,
+            "price": buy_px, "units": bought_units, "tax": 0.0,
+            "value": portfolio_value(dt), "reason": reason,
+        })
+
+    def state_row_on_or_before(dt):
+        available = state_history.loc[:dt]
+        if available.empty:
+            return None
+        return available.iloc[-1]
+
+    first_dt = idx[0]
+    transition_exec = {}
+    previous_hold = None
+    for signal_dt, row in state_history.iterrows():
+        hold = row["confirmed_hold_state"]
+        if signal_dt >= first_dt and previous_hold is not None and hold != previous_hold:
+            exec_dt = next_available_date(idx, signal_dt, "Next available close")
+            if exec_dt is not None:
+                transition_exec.setdefault(exec_dt, []).append((signal_dt, previous_hold, hold, row))
+        previous_hold = hold
+
+    contribution_exec = {}
+    if contribution_amount > 0:
+        contribution_dates = make_filter_evaluation_dates(idx, contribution_frequency)
+        for contribution_dt in contribution_dates:
+            row = state_row_on_or_before(contribution_dt)
+            if row is None:
+                continue
+            exec_dt = next_available_date(idx, contribution_dt, "Next available close")
+            if exec_dt is not None:
+                contribution_exec.setdefault(exec_dt, []).append((contribution_dt, row))
+
+    prior_state = state_history.loc[state_history.index < first_dt]
+    initial_row = prior_state.iloc[-1] if not prior_state.empty else None
+    if initial_row is None or initial_row["confirmed_signal"] == "OFF":
+        initial_target = defensive_asset
+        initial_reason = "Initial AGITQ defensive allocation"
+    else:
+        initial_target = initial_row["new_capital_target"]
+        initial_reason = "Initial AGITQ BUY allocation"
+
+    daily_cash_rate = (1 + cash_rate) ** (1 / 365.25) - 1
+    prev_dt = first_dt
+    total_contributions = 0.0
+
+    for dt in idx:
+        days = max((dt - prev_dt).days, 0)
+        if cash > 0 and days > 0:
+            cash *= (1 + daily_cash_rate) ** days
+
+        if dt == first_dt:
+            buy_amount(initial_target, cash, dt, initial_reason)
+            events.append({
+                "date": dt, "event": "INITIAL ALLOCATION", "reason": initial_reason,
+                "from_state": "CASH", "to_state": initial_target,
+            })
+
+        for signal_dt, old_hold, new_hold, row in transition_exec.get(dt, []):
+            old_on = old_hold != "OFF"
+            new_on = new_hold != "OFF"
+            confirmation_note = " — Confirmation completed" if confirmation_days else ""
+
+            if old_on and not new_on:
+                reason = "AGITQ SELL signal" + confirmation_note
+                sell_all(traded_asset, dt, reason)
+                sell_all(parking_asset, dt, reason)
+                buy_amount(defensive_asset, cash, dt, reason)
+            elif not old_on and new_on:
+                reason = "AGITQ BUY signal" + confirmation_note
+                sell_all(defensive_asset, dt, reason)
+                buy_amount(row["new_capital_target"], cash, dt, reason)
+            else:
+                reason = f"AGITQ hold-state change: {old_hold} → {new_hold}" + confirmation_note
+
+            events.append({
+                "date": dt, "signal_date": signal_dt, "event": "STATE CHANGE",
+                "reason": reason, "from_state": old_hold, "to_state": new_hold,
+                "temperature": row["temperature"],
+            })
+
+        for contribution_dt, row in contribution_exec.get(dt, []):
+            cash += contribution_amount
+            total_contributions += contribution_amount
+            target = row["new_capital_target"]
+            if row["confirmed_signal"] == "OFF":
+                reason = f"AGITQ OFF: new contribution → {defensive_asset}"
+            elif row["temperature"] == "Overheated" and target == parking_asset:
+                reason = "Overheated: new contribution → S&P parking asset"
+            elif row["temperature"] == "Focus":
+                reason = "Focus restored: new contribution → leveraged asset"
+            else:
+                reason = "AGITQ ON: new contribution → leveraged asset"
+            buy_amount(target, contribution_amount, dt, reason)
+            events.append({
+                "date": dt, "signal_date": contribution_dt, "event": "CONTRIBUTION",
+                "reason": reason, "amount": contribution_amount,
+                "to_state": target, "temperature": row["temperature"],
+            })
+
+        equity.loc[dt] = portfolio_value(dt)
+        active = [asset for asset, p in positions.items() if p["units"] > 0]
+        if cash > 0.005:
+            active.append("CASH")
+        holding_hist.loc[dt] = " + ".join(sorted(active)) if active else "CASH"
+        prev_dt = dt
+
+    return (
+        equity.dropna(),
+        pd.DataFrame(trades),
+        holding_hist.dropna(),
+        pd.DataFrame(events),
+        total_contributions,
+    )
 
 # ---------- 13. METRICS ----------
 def calculate_metrics(equity: pd.Series, trades: pd.DataFrame, holdings: pd.Series):
@@ -932,6 +1349,139 @@ def run_test(
         ),
     }
 
+def run_agitq_test(
+    variant,
+    signal_asset,
+    traded_asset,
+    defensive_asset="SGOV",
+    parking_asset="SPYM",
+    short_sma_days=None,
+    long_sma_days=None,
+    hybrid_entry_sma_days=None,
+    hybrid_exit_sma_days=None,
+    envelope_pct=0.05,
+    envelope_enabled=True,
+    confirmation_days=0,
+    partial_profit_taking=False,
+    contribution_amount=0.0,
+    contribution_frequency="Monthly",
+    base_currency="USD",
+    tax_rate=0.25,
+    tx_cost=0.001,
+    cash_rate=0.0,
+    benchmark_asset=None,
+    initial_value=100000,
+    start_date=None,
+    end_date=None,
+):
+    if partial_profit_taking:
+        raise ValueError(
+            "AGITQ partial profit-taking is unavailable because this backtester does not "
+            "yet track tax lots and milestone bases precisely. Leave it OFF."
+        )
+    if defensive_asset in (None, "None", ""):
+        defensive_asset = "CASH"
+    selected_positions = [traded_asset, parking_asset]
+    if defensive_asset != "CASH":
+        selected_positions.append(defensive_asset)
+    if len(set(selected_positions)) != len(selected_positions):
+        raise ValueError("Traded, defensive, and parking assets must be different.")
+
+    names = []
+    for name in [signal_asset, traded_asset, defensive_asset, parking_asset, benchmark_asset]:
+        if name and name not in ("None", "CASH") and name not in names:
+            names.append(name)
+    if not names:
+        raise ValueError("Load the AGITQ assets before running the strategy.")
+
+    all_prices = aligned_prices(names, base_currency)
+    start = pd.Timestamp(start_date).normalize() if start_date is not None else None
+    end = pd.Timestamp(end_date).normalize() if end_date is not None else None
+    if start is not None and end is not None and start > end:
+        raise ValueError("Start date must be on or before end date.")
+    history = all_prices.loc[:end] if end is not None else all_prices
+    prices = history.loc[start:] if start is not None else history
+    if len(prices) < 2:
+        raise ValueError("Choose a date range containing at least two available trading days.")
+
+    agitq_state = generate_agitq_state(
+        prices=history,
+        variant=variant,
+        signal_asset=signal_asset,
+        traded_asset=traded_asset,
+        defensive_asset=defensive_asset,
+        parking_asset=parking_asset,
+        short_sma_days=short_sma_days,
+        long_sma_days=long_sma_days,
+        hybrid_entry_sma_days=hybrid_entry_sma_days,
+        hybrid_exit_sma_days=hybrid_exit_sma_days,
+        envelope_pct=envelope_pct,
+        envelope_enabled=envelope_enabled,
+        confirmation_days=confirmation_days,
+    )
+    equity, trades, holdings, events, total_contributions = backtest_agitq(
+        prices=prices,
+        state_history=agitq_state,
+        traded_asset=traded_asset,
+        defensive_asset=defensive_asset,
+        parking_asset=parking_asset,
+        initial_value=initial_value,
+        tax_rate=tax_rate,
+        tx_cost=tx_cost,
+        cash_rate=cash_rate,
+        confirmation_days=confirmation_days,
+        contribution_amount=contribution_amount,
+        contribution_frequency=contribution_frequency,
+    )
+    metrics = calculate_metrics(equity, trades, holdings)
+
+    bench = None
+    bench_metrics = None
+    if benchmark_asset and benchmark_asset != "None":
+        bench = benchmark_buyhold(
+            prices.loc[equity.index.min():equity.index.max()], benchmark_asset, initial_value
+        )
+        bench = bench.reindex(equity.index).ffill().dropna()
+        bench_metrics = calculate_metrics(bench, pd.DataFrame(), pd.Series("BENCH", index=bench.index))
+        bench_metrics["Trades"] = 1
+
+    settings = {
+        "Strategy": AGITQ_STRATEGY_NAME,
+        "AGITQ variant": variant,
+        "Signal asset": signal_asset,
+        "Traded asset": traded_asset,
+        "Defensive asset": defensive_asset,
+        "S&P parking asset": parking_asset,
+        "Short SMA": short_sma_days,
+        "Long/reference SMA": long_sma_days,
+        "Hybrid entry SMA": hybrid_entry_sma_days,
+        "Hybrid exit SMA": hybrid_exit_sma_days,
+        "Envelope %": envelope_pct * 100,
+        "Overheat envelope": "ON" if envelope_enabled else "OFF",
+        "Signal confirmation days": confirmation_days,
+        "Partial profit-taking": "OFF — unavailable" if not partial_profit_taking else "ON",
+        "Contribution amount": contribution_amount,
+        "Contribution frequency": contribution_frequency,
+        "Execution": "Next available close",
+    }
+    audit_state = agitq_state.loc[prices.index.min():prices.index.max()].copy()
+    audit_state["actual_holding"] = holdings.reindex(audit_state.index).ffill()
+    return {
+        "prices": prices,
+        "signals": agitq_state["confirmed_signal"],
+        "equity": equity,
+        "trades": trades,
+        "holdings": holdings,
+        "metrics": metrics,
+        "benchmark": bench,
+        "benchmark_metrics": bench_metrics,
+        "cash_rate": cash_rate,
+        "agitq_settings": settings,
+        "agitq_state": audit_state,
+        "agitq_events": events,
+        "total_contributions": total_contributions,
+    }
+
 # ---------- 16. DISPLAY ----------
 def pct(x):
     return "—" if pd.isna(x) else f"{x*100:.1f}%"
@@ -965,7 +1515,17 @@ def show_result(result, benchmark_label=None):
         table[benchmark_label or "Benchmark"] = formatted_metrics(result["benchmark_metrics"])
     display(pd.DataFrame(table))
 
-    if result.get("market_filter_asset"):
+    if result.get("agitq_settings"):
+        print("\nAGITQ settings:")
+        display(pd.DataFrame(
+            list(result["agitq_settings"].items()), columns=["Setting", "Value"]
+        ))
+        if result.get("total_contributions", 0) > 0:
+            print(
+                f"Total periodic contributions: {money(result['total_contributions'])}. "
+                "Existing performance calculations are retained and therefore include deposited capital."
+            )
+    elif result.get("market_filter_asset"):
         print(
             f"\nMarket filter: {result['market_filter_asset']} — "
             f"{result['market_filter_rule']} ({result['market_filter_sma_days']}-day SMA). "
@@ -1011,11 +1571,64 @@ def show_result(result, benchmark_label=None):
         print("\nRecent trades:")
         display(result["trades"].tail(15))
 
+    if result.get("agitq_settings"):
+        if not result["agitq_events"].empty:
+            print("\nRecent AGITQ events:")
+            display(result["agitq_events"].tail(20))
+        print("\nRecent daily AGITQ state (full history is included in the export):")
+        display(result["agitq_state"].tail(20))
+
+        export_btn = widgets.Button(description="Export AGITQ audit ZIP", button_style="info")
+        export_out = widgets.Output()
+
+        def _export_clicked(_):
+            with export_out:
+                clear_output()
+                try:
+                    export_agitq_result(result)
+                except Exception as exc:
+                    print("ERROR:", exc)
+
+        export_btn.on_click(_export_clicked)
+        display(export_btn, export_out)
+
     print(
         "\nApproximation note: results depend on the selected price data. "
         "Dividends are only included if the chosen price series includes them. "
         "Tax is simplified to 25% of realized positive gains on each sale."
     )
+
+def export_agitq_result(result):
+    if not result.get("agitq_settings"):
+        raise ValueError("The current result is not an AGITQ backtest.")
+    export_dir = tempfile.mkdtemp(prefix="agitq_export_")
+    settings_path = f"{export_dir}/agitq_settings.csv"
+    pd.DataFrame(
+        list(result["agitq_settings"].items()), columns=["Setting", "Value"]
+    ).to_csv(settings_path, index=False)
+    result["agitq_state"].to_csv(f"{export_dir}/agitq_daily_state.csv", index_label="date")
+    result["trades"].to_csv(f"{export_dir}/agitq_trades.csv", index=False)
+    result["agitq_events"].to_csv(f"{export_dir}/agitq_events.csv", index=False)
+    result["equity"].rename("equity").to_csv(f"{export_dir}/agitq_equity.csv", index_label="date")
+    metrics_export = {
+        key: value for key, value in result["metrics"].items()
+        if key not in ("Allocation", "DrawdownSeries")
+    }
+    pd.DataFrame(list(metrics_export.items()), columns=["Metric", "Value"]).to_csv(
+        f"{export_dir}/agitq_metrics.csv", index=False
+    )
+    zip_path = f"{export_dir}/AGITQ_backtest_audit.zip"
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
+        for filename in [
+            "agitq_settings.csv", "agitq_daily_state.csv", "agitq_trades.csv",
+            "agitq_events.csv", "agitq_equity.csv", "agitq_metrics.csv",
+        ]:
+            archive.write(f"{export_dir}/{filename}", arcname=filename)
+    if IN_COLAB:
+        files.download(zip_path)
+    else:
+        display(FileLink(zip_path))
+    return zip_path
 
 # ---------- 17. BATCH TEST ----------
 def batch_momentum_test(
@@ -1088,6 +1701,7 @@ strategy_dd = widgets.Dropdown(
         "Relative Momentum",
         "SMA Trend",
         "SMA Hysteresis Envelope",
+        AGITQ_STRATEGY_NAME,
     ],
     description="Strategy:"
 )
@@ -1118,6 +1732,55 @@ execution_dd = widgets.Dropdown(
 lookback_slider = widgets.IntSlider(value=12, min=1, max=24, step=1, description="ROC months:")
 sma_slider = widgets.IntSlider(value=200, min=20, max=300, step=1, description="SMA days:")
 envelope_slider = widgets.FloatSlider(value=5.0, min=0.0, max=15.0, step=0.5, description="Envelope %:")
+
+agitq_variant_dd = widgets.Dropdown(
+    options=list(AGITQ_PRESETS.keys()), value="Original 200", description="Strategy variant:"
+)
+agitq_signal_asset_dd = widgets.Dropdown(options=["TQQQ"], value="TQQQ", description="Signal asset:")
+agitq_traded_asset_dd = widgets.Dropdown(options=["TQQQ"], value="TQQQ", description="Traded asset:")
+agitq_defensive_asset_dd = widgets.Dropdown(options=["SGOV", "CASH"], value="SGOV", description="Defensive:")
+agitq_parking_asset_dd = widgets.Dropdown(options=["SPYM"], value="SPYM", description="S&P parking:")
+agitq_short_sma_box = widgets.IntText(value=3, description="Short SMA:")
+agitq_long_sma_box = widgets.IntText(value=200, description="Long SMA:")
+agitq_entry_sma_box = widgets.IntText(value=185, description="Entry SMA:")
+agitq_exit_sma_box = widgets.IntText(value=161, description="Exit SMA:")
+agitq_envelope_box = widgets.FloatText(value=5.0, description="Envelope %:")
+agitq_envelope_enabled_cb = widgets.Checkbox(value=True, description="Overheat envelope ON")
+agitq_confirmation_dd = widgets.Dropdown(options=[0, 2, 3], value=0, description="Confirmation days:")
+agitq_profit_taking_cb = widgets.Checkbox(
+    value=False, description="Partial profit-taking (unavailable)", disabled=True
+)
+agitq_contribution_box = widgets.FloatText(value=0.0, description="Contribution:")
+agitq_contribution_frequency_dd = widgets.Dropdown(
+    options=["Monthly", "Weekly", "Daily"], value="Monthly", description="Contribution frequency:"
+)
+
+agitq_short_row = widgets.HBox([agitq_short_sma_box, agitq_long_sma_box])
+agitq_hybrid_row = widgets.HBox([agitq_entry_sma_box, agitq_exit_sma_box])
+agitq_controls_box = widgets.VBox([
+    widgets.HTML("<h4>AGITQ / TQQQ Playbook settings</h4>"),
+    agitq_variant_dd,
+    widgets.HBox([agitq_signal_asset_dd, agitq_traded_asset_dd]),
+    widgets.HBox([agitq_defensive_asset_dd, agitq_parking_asset_dd]),
+    agitq_short_row,
+    agitq_hybrid_row,
+    widgets.HBox([agitq_envelope_box, agitq_envelope_enabled_cb, agitq_confirmation_dd]),
+    widgets.HBox([agitq_contribution_box, agitq_contribution_frequency_dd]),
+    agitq_profit_taking_cb,
+    widgets.HTML(
+        "AGITQ uses daily adjusted closes and executes confirmed signals at the next available close. "
+        "Partial profit-taking remains disabled because exact tax-lot milestone accounting is not available."
+    ),
+])
+agitq_controls_box.layout.display = "none"
+
+market_filter_controls_box = widgets.VBox([
+    widgets.HBox([market_filter_asset_dd, market_filter_rule_dd, market_filter_frequency_dd]),
+    widgets.HTML(
+        "The market filter uses the SMA days setting below and forces CASH when the selected asset is not above its SMA. "
+        "Filter evaluation frequency controls when its state can update; it does not change the strategy signal frequency."
+    ),
+])
 
 tax_box = widgets.FloatText(value=25.0, description="Tax %:")
 fee_box = widgets.FloatText(value=0.1, description="Trade cost %:")
@@ -1160,6 +1823,70 @@ def _download_online_clicked(_):
 
 online_download_btn.on_click(_download_online_clicked)
 
+def _agitq_asset_options():
+    defaults = ["QQQ", "TQQQ", "QLD", "SGOV", "SPYM"]
+    return list(dict.fromkeys(defaults + list(ASSETS.keys())))
+
+def refresh_agitq_asset_dropdowns():
+    options = _agitq_asset_options()
+    for dropdown, allow_cash in [
+        (agitq_signal_asset_dd, False),
+        (agitq_traded_asset_dd, False),
+        (agitq_defensive_asset_dd, True),
+        (agitq_parking_asset_dd, False),
+    ]:
+        selected = dropdown.value
+        dropdown.options = (["CASH"] if allow_cash else []) + options
+        if selected in dropdown.options:
+            dropdown.value = selected
+
+def _update_agitq_variant_visibility():
+    hybrid = agitq_variant_dd.value == "Hybrid 3/185/161"
+    original = agitq_variant_dd.value == "Original 200"
+    agitq_short_sma_box.layout.display = "none" if original else ""
+    agitq_long_sma_box.layout.display = "none" if hybrid else ""
+    agitq_hybrid_row.layout.display = "" if hybrid else "none"
+
+def _apply_agitq_preset(_=None):
+    preset = AGITQ_PRESETS[agitq_variant_dd.value]
+    refresh_agitq_asset_dropdowns()
+    for dropdown, value in [
+        (agitq_signal_asset_dd, preset["signal_asset"]),
+        (agitq_traded_asset_dd, preset["traded_asset"]),
+        (agitq_defensive_asset_dd, "SGOV"),
+        (agitq_parking_asset_dd, "SPYM"),
+    ]:
+        if value in dropdown.options:
+            dropdown.value = value
+    if preset["short_sma"] is not None:
+        agitq_short_sma_box.value = preset["short_sma"]
+    if preset["long_sma"] is not None:
+        agitq_long_sma_box.value = preset["long_sma"]
+    if preset["entry_sma"] is not None:
+        agitq_entry_sma_box.value = preset["entry_sma"]
+    if preset["exit_sma"] is not None:
+        agitq_exit_sma_box.value = preset["exit_sma"]
+    agitq_envelope_box.value = 5.0
+    agitq_envelope_enabled_cb.value = True
+    agitq_confirmation_dd.value = 0
+    agitq_profit_taking_cb.value = False
+    _update_agitq_variant_visibility()
+
+def _strategy_changed(change=None):
+    is_agitq = strategy_dd.value == AGITQ_STRATEGY_NAME
+    agitq_controls_box.layout.display = "" if is_agitq else "none"
+    market_filter_controls_box.layout.display = "none" if is_agitq else ""
+    for widget in [
+        primary_dd, secondary_dd, freq_dd, execution_dd,
+        lookback_slider, sma_slider, envelope_slider,
+    ]:
+        widget.layout.display = "none" if is_agitq else ""
+
+agitq_variant_dd.observe(_apply_agitq_preset, names="value")
+strategy_dd.observe(_strategy_changed, names="value")
+_apply_agitq_preset()
+_strategy_changed()
+
 def refresh_strategy_dropdowns():
     selected_filter = market_filter_asset_dd.value
     opts = list(ASSETS.keys())
@@ -1170,11 +1897,44 @@ def refresh_strategy_dropdowns():
     market_filter_asset_dd.value = selected_filter if selected_filter in opts else "None"
     if opts:
         primary_dd.value = opts[0]
+    refresh_agitq_asset_dropdowns()
 
 def _run_clicked(_):
     with result_output:
         clear_output()
         try:
+            if strategy_dd.value == AGITQ_STRATEGY_NAME:
+                variant = agitq_variant_dd.value
+                hybrid = variant == "Hybrid 3/185/161"
+                original = variant == "Original 200"
+                result = run_agitq_test(
+                    variant=variant,
+                    signal_asset=agitq_signal_asset_dd.value,
+                    traded_asset=agitq_traded_asset_dd.value,
+                    defensive_asset=agitq_defensive_asset_dd.value,
+                    parking_asset=agitq_parking_asset_dd.value,
+                    short_sma_days=None if original else agitq_short_sma_box.value,
+                    long_sma_days=None if hybrid else agitq_long_sma_box.value,
+                    hybrid_entry_sma_days=agitq_entry_sma_box.value if hybrid else None,
+                    hybrid_exit_sma_days=agitq_exit_sma_box.value if hybrid else None,
+                    envelope_pct=agitq_envelope_box.value / 100,
+                    envelope_enabled=agitq_envelope_enabled_cb.value,
+                    confirmation_days=agitq_confirmation_dd.value,
+                    partial_profit_taking=agitq_profit_taking_cb.value,
+                    contribution_amount=agitq_contribution_box.value,
+                    contribution_frequency=agitq_contribution_frequency_dd.value,
+                    base_currency=base_dd.value,
+                    tax_rate=tax_box.value / 100,
+                    tx_cost=fee_box.value / 100,
+                    cash_rate=cash_box.value / 100,
+                    benchmark_asset=benchmark_dd.value,
+                    initial_value=initial_box.value,
+                    start_date=start_date_picker.value,
+                    end_date=end_date_picker.value,
+                )
+                show_result(result, benchmark_dd.value)
+                return
+
             if not primary_dd.value:
                 print("Upload and configure at least one dataset first.")
                 return
@@ -1270,11 +2030,8 @@ def launch_backtester():
     display(widgets.VBox([
         widgets.HBox([strategy_dd, primary_dd, secondary_dd]),
         widgets.HBox([benchmark_dd, base_dd, freq_dd, execution_dd]),
-        widgets.HBox([market_filter_asset_dd, market_filter_rule_dd, market_filter_frequency_dd]),
-        widgets.HTML(
-            "The market filter uses the SMA days setting below and forces CASH when the selected asset is not above its SMA. "
-            "Filter evaluation frequency controls when its state can update; it does not change the strategy signal frequency."
-        ),
+        market_filter_controls_box,
+        agitq_controls_box,
         widgets.HBox([start_date_picker, end_date_picker]),
         widgets.HTML("Leave dates blank for the full available history. Earlier data is used for indicators; "
                      "the latest earlier signal sets the position at the first available close. "
