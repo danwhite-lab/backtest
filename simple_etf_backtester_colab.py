@@ -2484,7 +2484,7 @@ def _run_clicked(_):
                     end_date=end_date_picker.value,
                 )
                 saved_id = save_backtest_result(result)
-                refresh_results_history_controls()
+                refresh_results_history()
                 print(f"Saved backtest #{saved_id} to Results History.")
                 show_result(result, benchmark_dd.value)
                 return
@@ -2515,7 +2515,7 @@ def _run_clicked(_):
                 market_filter_evaluation_frequency=market_filter_frequency_dd.value,
             )
             saved_id = save_backtest_result(result)
-            refresh_results_history_controls()
+            refresh_results_history()
             print(f"Saved backtest #{saved_id} to Results History.")
             show_result(result, benchmark_dd.value)
         except Exception as e:
@@ -2561,31 +2561,27 @@ def launch_backtester():
     upload_btn = widgets.Button(description="Upload CSV / Excel", button_style="info", layout=widgets.Layout(width="190px"))
     upload_btn.on_click(lambda _: upload_csvs())
 
-    display(widgets.HTML("<h2>Simple ETF Backtester</h2>"))
-    display(widgets.HTML(
-        "<b>Purpose:</b> approximate, consistent comparison of ETF strategies. "
-        "Not a brokerage-grade tax simulator."
-    ))
-
-    display(widgets.HTML("<h3>Download ETF or stock prices online</h3>"))
-    display(widgets.HBox([online_ticker_box, online_currency_dd, online_download_btn]))
-    display(widgets.HBox([online_start_picker, online_end_picker]))
-    display(widgets.HTML(
-        "Enter a Yahoo Finance ticker. Leave the dates blank for all available history. "
-        "Downloaded prices use Adjusted Close when available."
-    ))
-    display(online_output)
-
-    display(widgets.HTML("<h3>Or upload CSV / Excel files</h3>"))
-    display(upload_btn)
-    display(import_output)
-
-    display(widgets.HTML("<h3>Optional FX conversion</h3>"))
-    display(widgets.HBox([fx_asset_dd, fx_orientation_dd, fx_btn]))
-    display(fx_out)
-
-    display(widgets.HTML("<h3>Backtest</h3>"))
-    display(widgets.VBox([
+    backtest_box = widgets.VBox([
+        widgets.HTML("<h2>Simple ETF Backtester</h2>"),
+        widgets.HTML(
+            "<b>Purpose:</b> approximate, consistent comparison of ETF strategies. "
+            "Not a brokerage-grade tax simulator."
+        ),
+        widgets.HTML("<h3>Download ETF or stock prices online</h3>"),
+        widgets.HBox([online_ticker_box, online_currency_dd, online_download_btn]),
+        widgets.HBox([online_start_picker, online_end_picker]),
+        widgets.HTML(
+            "Enter a Yahoo Finance ticker. Leave the dates blank for all available history. "
+            "Downloaded prices use Adjusted Close when available."
+        ),
+        online_output,
+        widgets.HTML("<h3>Or upload CSV / Excel files</h3>"),
+        upload_btn,
+        import_output,
+        widgets.HTML("<h3>Optional FX conversion</h3>"),
+        widgets.HBox([fx_asset_dd, fx_orientation_dd, fx_btn]),
+        fx_out,
+        widgets.HTML("<h3>Backtest</h3>"),
         widgets.HBox([strategy_dd, primary_dd, secondary_dd]),
         widgets.HBox([benchmark_dd, base_dd, freq_dd, execution_dd]),
         market_filter_controls_box,
@@ -2601,9 +2597,12 @@ def launch_backtester():
         widgets.HTML("Cash return is an annual rate applied while the strategy holds CASH; it compounds between trading dates."),
         run_btn,
         result_output
-    ]))
-
-    display(history_box)
+    ])
+    app_tabs = widgets.Tab(children=[backtest_box, history_box])
+    app_tabs.set_title(0, "Backtest")
+    app_tabs.set_title(1, "Results History")
+    app_tabs.selected_index = 0
+    display(app_tabs)
     refresh_results_history()
 
 launch_backtester()
