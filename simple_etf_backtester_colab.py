@@ -1099,8 +1099,12 @@ def run_haa_test(strategy, base_currency="USD", initial_value=100000.0, tax_rate
 def download_fred_series(series_id: str) -> pd.Series:
     """Download revised historical FRED data; this is not point-in-time vintage data."""
     url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
-    frame = pd.read_csv(url, parse_dates=["DATE"], na_values=["."])
-    return pd.to_numeric(frame.set_index("DATE")[series_id], errors="coerce").dropna().sort_index()
+    frame = pd.read_csv(url, na_values=["."])
+    date_column = "observation_date" if "observation_date" in frame.columns else "DATE"
+    if date_column not in frame.columns or series_id not in frame.columns:
+        raise ValueError(f"Unexpected FRED response while loading {series_id}.")
+    frame[date_column] = pd.to_datetime(frame[date_column])
+    return pd.to_numeric(frame.set_index(date_column)[series_id], errors="coerce").dropna().sort_index()
 
 def gtt_previous_month_yoy(series: pd.Series, decision_date: pd.Timestamp):
     observation_date = (decision_date.to_period("M") - 1).to_timestamp("M")
