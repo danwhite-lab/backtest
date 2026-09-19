@@ -69,6 +69,7 @@ DEFAULT_BASE_CURRENCY = "USD"
 AGITQ_STRATEGY_NAME = "AGITQ / TQQQ Playbook"
 HAA_SIMPLE_STRATEGY_NAME = "HAA-Simple (HAA-1 / U1-T1)"
 HAA_BALANCED_STRATEGY_NAME = "HAA-Balanced (G8/T4)"
+GTT_ORIGINAL_STRATEGY_NAME = "Growth-Trend Timing (GTT-Original)"
 HAA_CANARY = "TIP"
 HAA_DEFENSIVE = ["BIL", "IEF"]
 HAA_BALANCED_OFFENSIVE = ["SPY", "IWM", "VEA", "VWO", "VNQ", "DBC", "IEF", "TLT"]
@@ -1088,6 +1089,51 @@ def run_haa_test(strategy, base_currency="USD", initial_value=100000.0, tax_rate
     targets = targets.loc[targets.index <= prices.index.max()]
     equity, trades, holdings = backtest_weighted_monthly(prices, targets, initial_value, tax_rate, tx_cost, execution_mode)
     return {"equity": equity, "trades": trades, "holdings": holdings, "metrics": calculate_metrics(equity, trades, holdings, initial_value=initial_value), "haa_audit": audit, "haa_momentum": momentum, "settings": {"Strategy": strategy, "Execution": execution_mode, "Tax %": tax_rate * 100, "Transaction cost %": tx_cost * 100, "Initial capital": initial_value}, "cash_rate": 0.0, "benchmark": None, "benchmark_metrics": None, "initial_value": initial_value, "total_contributions": 0.0, "external_flows": pd.Series(0.0, index=equity.index)}
+
+# ---------- 11C. CANONICAL GTT SIGNALS ----------
+def download_fred_series(series_id: str) -> pd.Series:
+    """Download revised historical FRED data; this is not point-in-time vintage data."""
+    url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
+    frame = pd.read_csv(url, parse_dates=["DATE"], na_values=["."])
+    return pd.to_numeric(frame.set_index("DATE")[series_id], errors="coerce").dropna().sort_index()
+
+def gtt_previous_month_yoy(series: pd.Series, decision_date: pd.Timestamp):
+    observation_date = (decision_date.to_period("M") - 1).to_timestamp("M")
+    available = series.loc[:observation_date]
+    if available.empty:
+        return np.nan, np.nan
+    value_date, value = available.index[-1], available.iloc[-1]
+    prior = series.loc[:value_date - pd.DateOffset(months=12)]
+    return value, (value / prior.iloc[-1] - 1.0) if not prior.empty else np.nan
+
+def generate_gtt_signals(prices: pd.Series, rrsfs: pd.Series, indpro: pd.Series):
+    """Original GTT: prior-month economic YoY plus a 10-month monthly-price SMA."""
+    dates = make_filter_evaluation_dates(prices.index, "Monthly")
+    monthly_price = prices.reindex(dates)
+    sma_10 = monthly_price.rolling(10, min_periods=10).mean()
+    signals, audit = {}, []
+    for dt in dates:
+        retail, retail_yoy = gtt_previous_month_yoy(rrsfs, dt)
+        industrial, industrial_yoy = gtt_previous_month_yoy(indpro, dt)
+        healthy = bool(pd.notna(retail_yoy) and pd.notna(industrial_yoy) and retail_yoy > 0 and industrial_yoy > 0)
+        above = bool(pd.notna(sma_10.loc[dt]) and monthly_price.loc[dt] >= sma_10.loc[dt])
+        allocation = "SPY" if healthy or above else "CASH"
+        signals[dt] = allocation
+        audit.append({"Date": dt, "RRSFS previous-month value": retail, "RRSFS YoY": retail_yoy, "INDPRO previous-month value": industrial, "INDPRO YoY": industrial_yoy, "Growth regime": "Growth Healthy" if healthy else "Growth Warning", "Equity month-end price": monthly_price.loc[dt], "10-month SMA": sma_10.loc[dt], "Above SMA": above, "Allocation": allocation, "Signal date": dt})
+    return pd.Series(signals, dtype="object"), pd.DataFrame(audit)
+
+def run_gtt_test(base_currency="USD", initial_value=100000.0, tax_rate=0.25, tx_cost=0.001, cash_rate=0.0, execution_mode="Next available close", start_date=None, end_date=None):
+    prices_all = aligned_prices(["SPY"], base_currency)
+    history = prices_all.loc[:pd.Timestamp(end_date)] if end_date is not None else prices_all
+    rrsfs, indpro = download_fred_series("RRSFS"), download_fred_series("INDPRO")
+    raw_signals, audit = generate_gtt_signals(history["SPY"], rrsfs, indpro)
+    prices = history.loc[pd.Timestamp(start_date):] if start_date is not None else history
+    prior = raw_signals.loc[raw_signals.index < prices.index.min()].tail(1)
+    signals = pd.concat([prior, raw_signals.loc[prices.index.min():prices.index.max()]])
+    equity, trades, holdings = backtest(prices, signals, initial_value, tax_rate, tx_cost, cash_rate, execution_mode)
+    execution_dates = [next_available_date(prices.index, dt, execution_mode) for dt in audit["Signal date"]]
+    audit["Execution date"] = execution_dates
+    return {"equity": equity, "trades": trades, "holdings": holdings, "metrics": calculate_metrics(equity, trades, holdings, initial_value=initial_value), "gtt_audit": audit, "settings": {"Strategy": GTT_ORIGINAL_STRATEGY_NAME, "Economic data": "Revised historical economic data", "Execution": execution_mode, "Tax %": tax_rate * 100, "Transaction cost %": tx_cost * 100}, "cash_rate": cash_rate, "benchmark": None, "benchmark_metrics": None, "initial_value": initial_value, "total_contributions": 0.0, "external_flows": pd.Series(0.0, index=equity.index)}
 
 # ---------- 12. BACKTEST ----------
 def backtest(
@@ -2503,6 +2549,7 @@ strategy_dd = widgets.Dropdown(
         "SMA Hysteresis Envelope",
         HAA_SIMPLE_STRATEGY_NAME,
         HAA_BALANCED_STRATEGY_NAME,
+        GTT_ORIGINAL_STRATEGY_NAME,
         AGITQ_STRATEGY_NAME,
     ],
     description="Strategy:"
@@ -2897,14 +2944,15 @@ def _apply_agitq_preset(_=None):
 def _strategy_changed(change=None):
     is_agitq = strategy_dd.value == AGITQ_STRATEGY_NAME
     is_haa = strategy_dd.value in (HAA_SIMPLE_STRATEGY_NAME, HAA_BALANCED_STRATEGY_NAME)
+    is_gtt = strategy_dd.value == GTT_ORIGINAL_STRATEGY_NAME
     agitq_controls_box.layout.display = "" if is_agitq else "none"
     market_filter_controls_box.layout.display = "none" if is_agitq else ""
     for widget in [
         primary_dd, secondary_dd, freq_dd, execution_dd,
         lookback_slider, sma_slider, envelope_slider,
     ]:
-        widget.layout.display = "none" if (is_agitq or (is_haa and widget is not execution_dd)) else ""
-    if is_haa:
+        widget.layout.display = "none" if (is_agitq or ((is_haa or is_gtt) and widget is not execution_dd)) else ""
+    if is_haa or is_gtt:
         market_filter_controls_box.layout.display = "none"
 
 agitq_variant_dd.observe(_apply_agitq_preset, names="value")
@@ -3027,6 +3075,12 @@ def _run_clicked(_):
     with result_output:
         clear_output()
         try:
+            if strategy_dd.value == GTT_ORIGINAL_STRATEGY_NAME:
+                result = run_gtt_test(base_currency=base_dd.value, initial_value=initial_box.value, tax_rate=tax_box.value / 100, tx_cost=fee_box.value / 100, cash_rate=cash_box.value / 100, execution_mode=execution_dd.value, start_date=start_date_picker.value, end_date=end_date_picker.value)
+                show_result(result)
+                print("\nGTT monthly decision audit — Revised historical economic data (not point-in-time vintage data):")
+                display(result["gtt_audit"])
+                return
             if strategy_dd.value in (HAA_SIMPLE_STRATEGY_NAME, HAA_BALANCED_STRATEGY_NAME):
                 result = run_haa_test(
                     strategy=strategy_dd.value, base_currency=base_dd.value,
