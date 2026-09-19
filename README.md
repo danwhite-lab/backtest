@@ -10,6 +10,10 @@ An interactive Google Colab backtester for ETF and stock strategies.
 - Upload CSV, XLSX, or XLS price files as an alternative.
 - Automatically detect common date formats and price columns.
 - Compare buy-and-hold, absolute momentum, dual momentum, relative momentum, SMA trend, and SMA Hysteresis Envelope strategies.
+- Run Original 200, QQQ 3/161, QLD ISA, TQQQ 5/218, and Hybrid 3/185/161 AGITQ playbook variants.
+- Configure AGITQ signal/traded/defensive/parking assets, confirmation days, SMA periods, and the optional overheat envelope.
+- Route AGITQ periodic contributions to the leveraged or S&P parking asset according to the daily temperature state.
+- Inspect and export AGITQ settings, trades, events, performance, and full daily signal state.
 - Apply an optional external `Price > SMA` market filter using any loaded dataset, including an asset outside the tradable universe.
 - Evaluate the external market filter daily, weekly, or monthly without changing the strategy's own signal frequency.
 - Convert between USD and ILS using an uploaded FX series.
@@ -25,6 +29,10 @@ An interactive Google Colab backtester for ETF and stock strategies.
 4. Choose the strategy, primary asset, optional second asset, and benchmark.
 5. Optionally choose a **Market filter** asset and **Filter evaluation frequency**. Its price must be above the selected **SMA days** value or the strategy holds cash.
 6. Enter the remaining backtest assumptions and click **Run backtest**.
+
+For AGITQ, first load each required adjusted-price series, normally `QQQ`, `TQQQ` or `QLD`, `SGOV`, and `SPYM`. Select **AGITQ / TQQQ Playbook**, choose a preset, and adjust the relevant controls if needed. AGITQ signals use daily observations and execute at the next available close.
+
+AGITQ partial profit-taking is shown as unavailable and remains disabled. The current accounting engine does not track the tax lots and milestone bases needed to implement that feature exactly.
 
 Leave the online date fields blank to request all available history. Online downloads use Yahoo Finance `Adjusted Close` when it is available, so splits and distributions are reflected in the price series supplied by Yahoo.
 
