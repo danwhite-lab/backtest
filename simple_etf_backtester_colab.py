@@ -599,6 +599,7 @@ def apply_market_filter(
     filter_asset: Optional[str],
     rule: str,
     sma_days: int,
+    evaluation_frequency: str = "Daily",
 ) -> pd.Series:
     """Force underlying strategy signals to CASH when an external filter fails."""
     if filter_asset is None or filter_asset == "None":
@@ -608,16 +609,56 @@ def apply_market_filter(
     if filter_asset not in prices.columns:
         raise ValueError(f"Market filter asset is unavailable: {filter_asset}")
 
+    filter_state = calculate_market_filter_state(
+        prices=prices,
+        filter_asset=filter_asset,
+        rule=rule,
+        sma_days=sma_days,
+        evaluation_frequency=evaluation_frequency,
+    )
     filtered = signals.copy()
-    filter_series = prices[filter_asset]
     for dt in filtered.index:
-        # Both values use observations on or before the decision date. If there
-        # is not yet enough history for the SMA, stay in cash.
-        sma = sma_value(filter_series, dt, sma_days)
-        px = last_price_on_or_before(prices[[filter_asset]], dt)[filter_asset]
-        if pd.isna(sma) or not (px > sma):
+        latest_state = filter_state.loc[:dt]
+        if latest_state.empty or not bool(latest_state.iloc[-1]):
             filtered.loc[dt] = "CASH"
     return filtered
+
+def make_filter_evaluation_dates(
+    index: pd.DatetimeIndex,
+    evaluation_frequency: str,
+) -> pd.DatetimeIndex:
+    """Return actual aligned trading dates when the filter may change state."""
+    if evaluation_frequency == "Daily":
+        return index
+    if evaluation_frequency not in ("Weekly", "Monthly"):
+        raise ValueError(f"Unknown filter evaluation frequency: {evaluation_frequency}")
+
+    observations = pd.Series(index=index, data=index)
+    resample_rule = "W-FRI" if evaluation_frequency == "Weekly" else "ME"
+    actual_dates = observations.resample(resample_rule).last().dropna().tolist()
+    return pd.DatetimeIndex(actual_dates)
+
+def calculate_market_filter_state(
+    prices: pd.DataFrame,
+    filter_asset: str,
+    rule: str,
+    sma_days: int,
+    evaluation_frequency: str,
+) -> pd.Series:
+    """Calculate ON/OFF states without using observations after each date."""
+    if rule != "Price > SMA":
+        raise ValueError(f"Unsupported market filter rule: {rule}")
+    if filter_asset not in prices.columns:
+        raise ValueError(f"Market filter asset is unavailable: {filter_asset}")
+
+    filter_series = prices[filter_asset]
+    evaluation_dates = make_filter_evaluation_dates(prices.index, evaluation_frequency)
+    states = pd.Series(index=evaluation_dates, dtype="bool", name="Market filter ON")
+    for dt in evaluation_dates:
+        sma = sma_value(filter_series, dt, sma_days)
+        px = last_price_on_or_before(prices[[filter_asset]], dt)[filter_asset]
+        states.loc[dt] = bool(pd.notna(sma) and px > sma)
+    return states
 
 # ---------- 11. EXECUTION DATE ----------
 def next_available_date(index: pd.DatetimeIndex, signal_dt: pd.Timestamp, mode: str):
@@ -798,6 +839,7 @@ def run_test(
     end_date=None,
     market_filter_asset=None,
     market_filter_rule="Price > SMA",
+    market_filter_evaluation_frequency="Daily",
 ):
     names = [primary]
     if secondary and secondary != "None" and secondary not in names:
@@ -839,6 +881,7 @@ def run_test(
         filter_asset=filter_asset,
         rule=market_filter_rule,
         sma_days=sma_days,
+        evaluation_frequency=market_filter_evaluation_frequency,
     )
 
     # Carry the latest known target into the first available test close.
@@ -884,6 +927,9 @@ def run_test(
         "market_filter_asset": filter_asset,
         "market_filter_rule": market_filter_rule if filter_asset else None,
         "market_filter_sma_days": sma_days if filter_asset else None,
+        "market_filter_evaluation_frequency": (
+            market_filter_evaluation_frequency if filter_asset else None
+        ),
     }
 
 # ---------- 16. DISPLAY ----------
@@ -923,6 +969,7 @@ def show_result(result, benchmark_label=None):
         print(
             f"\nMarket filter: {result['market_filter_asset']} — "
             f"{result['market_filter_rule']} ({result['market_filter_sma_days']}-day SMA). "
+            f"Filter evaluation frequency: {result['market_filter_evaluation_frequency']}. "
             "When the rule is false or the SMA is unavailable, the strategy holds CASH."
         )
     else:
@@ -985,6 +1032,7 @@ def batch_momentum_test(
     sma_days=200,
     market_filter_asset=None,
     market_filter_rule="Price > SMA",
+    market_filter_evaluation_frequency="Daily",
 ):
     rows = []
     for secondary in secondary_options:
@@ -1005,6 +1053,7 @@ def batch_momentum_test(
                     sma_days=sma_days,
                     market_filter_asset=market_filter_asset,
                     market_filter_rule=market_filter_rule,
+                    market_filter_evaluation_frequency=market_filter_evaluation_frequency,
                 )
                 m = r["metrics"]
                 rows.append({
@@ -1049,6 +1098,13 @@ benchmark_dd = widgets.Dropdown(options=["None"], description="Benchmark:")
 market_filter_asset_dd = widgets.Dropdown(options=["None"], value="None", description="Market filter:")
 market_filter_rule_dd = widgets.Dropdown(
     options=["Price > SMA"], value="Price > SMA", description="Filter rule:"
+)
+market_filter_frequency_dd = widgets.Dropdown(
+    options=["Daily", "Weekly", "Monthly"],
+    value="Daily",
+    description="Filter evaluation frequency:",
+    style={"description_width": "initial"},
+    layout=widgets.Layout(width="330px"),
 )
 
 base_dd = widgets.Dropdown(options=["USD","ILS"], value="USD", description="Base:")
@@ -1142,6 +1198,7 @@ def _run_clicked(_):
                 end_date=end_date_picker.value,
                 market_filter_asset=market_filter_asset_dd.value,
                 market_filter_rule=market_filter_rule_dd.value,
+                market_filter_evaluation_frequency=market_filter_frequency_dd.value,
             )
             show_result(result, benchmark_dd.value)
         except Exception as e:
@@ -1213,8 +1270,11 @@ def launch_backtester():
     display(widgets.VBox([
         widgets.HBox([strategy_dd, primary_dd, secondary_dd]),
         widgets.HBox([benchmark_dd, base_dd, freq_dd, execution_dd]),
-        widgets.HBox([market_filter_asset_dd, market_filter_rule_dd]),
-        widgets.HTML("The market filter uses the SMA days setting below and forces CASH when the selected asset is not above its SMA."),
+        widgets.HBox([market_filter_asset_dd, market_filter_rule_dd, market_filter_frequency_dd]),
+        widgets.HTML(
+            "The market filter uses the SMA days setting below and forces CASH when the selected asset is not above its SMA. "
+            "Filter evaluation frequency controls when its state can update; it does not change the strategy signal frequency."
+        ),
         widgets.HBox([start_date_picker, end_date_picker]),
         widgets.HTML("Leave dates blank for the full available history. Earlier data is used for indicators; "
                      "the latest earlier signal sets the position at the first available close. "
