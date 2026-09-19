@@ -16,7 +16,7 @@
 # - Relative Momentum
 # - Optional external market filter (Price > SMA)
 # - SMA Trend
-# - Playbook-style SMA + envelope
+# - SMA Hysteresis Envelope
 # - Daily / Weekly / Monthly signals
 # - Same-close or next-available-close execution
 # - Approximate 25% realized capital-gains tax
@@ -569,7 +569,7 @@ def generate_signals(
             holdings.loc[dt] = primary if px > sma else "CASH"
         return holdings.dropna()
 
-    if strategy == "Playbook Envelope":
+    if strategy == "SMA Hysteresis Envelope":
         s = prices[primary]
         state = "CASH"
         for dt in sig_dates:
@@ -1038,7 +1038,7 @@ strategy_dd = widgets.Dropdown(
         "Dual Momentum",
         "Relative Momentum",
         "SMA Trend",
-        "Playbook Envelope",
+        "SMA Hysteresis Envelope",
     ],
     description="Strategy:"
 )
