@@ -43,7 +43,7 @@ When periodic contributions are enabled, the results table labels the strategy's
 
 ## Results history
 
-Every successful interactive test is saved automatically, and each completed combination in `batch_momentum_test` is saved separately. The database is `simple_etf_backtester_results.sqlite` in the current working directory. The Results History panel supports combined strategy, asset, setting, period, and numeric filters such as `> 10%`, `> -30%`, and `> 0.6`, plus sorting, deletion of selected rows, and CSV export. To store the database elsewhere, set the `ETF_BACKTESTER_RESULTS_DB` environment variable before running the notebook. In Colab, point it at an already-mounted Google Drive location if you need results to survive a runtime reset.
+Every successful interactive test is saved automatically, and each completed combination in `batch_momentum_test` is saved separately. The notebook has **Backtest** and **Results History** tabs, so saved results can be reviewed without scrolling through the backtest controls. The database is `simple_etf_backtester_results.sqlite` in the current working directory. The Results History tab supports combined strategy, asset, setting, period, and numeric filters such as `> 10%`, `> -30%`, and `> 0.6`, plus sorting, deletion of selected rows, and CSV export. To store the database elsewhere, set the `ETF_BACKTESTER_RESULTS_DB` environment variable before running the notebook. In Colab, point it at an already-mounted Google Drive location if you need results to survive a runtime reset.
 
 Leave the online date fields blank to request all available history. Online downloads use Yahoo Finance `Adjusted Close` when it is available, so splits and distributions are reflected in the price series supplied by Yahoo.
 
