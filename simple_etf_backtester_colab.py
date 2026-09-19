@@ -37,6 +37,7 @@
 import sys, subprocess, pkgutil, io, math, warnings, json, zipfile, tempfile, os, sqlite3, re
 from dataclasses import dataclass
 from datetime import date, datetime
+from itertools import product
 from typing import Dict, Optional, List, Tuple
 
 required = ["pandas", "numpy", "matplotlib", "ipywidgets", "openpyxl", "xlrd", "yfinance"]
@@ -66,6 +67,11 @@ DEFAULT_CASH_RATE = 0.0
 DEFAULT_BASE_CURRENCY = "USD"
 
 AGITQ_STRATEGY_NAME = "AGITQ / TQQQ Playbook"
+HAA_SIMPLE_STRATEGY_NAME = "HAA-Simple (HAA-1 / U1-T1)"
+HAA_BALANCED_STRATEGY_NAME = "HAA-Balanced (G8/T4)"
+HAA_CANARY = "TIP"
+HAA_DEFENSIVE = ["BIL", "IEF"]
+HAA_BALANCED_OFFENSIVE = ["SPY", "IWM", "VEA", "VWO", "VNQ", "DBC", "IEF", "TLT"]
 AGITQ_PRESETS = {
     "Original 200": {
         "signal_asset": "TQQQ", "traded_asset": "TQQQ",
@@ -698,6 +704,60 @@ def calculate_market_filter_state(
         states.loc[dt] = bool(pd.notna(sma) and px > sma)
     return states
 
+def build_market_filter_diagnostics(
+    prices: pd.DataFrame,
+    filter_asset: str,
+    rule: str,
+    sma_days: int,
+    evaluation_frequency: str,
+    holdings: pd.Series,
+    trades: pd.DataFrame,
+) -> pd.DataFrame:
+    """Return an auditable daily view of the state actually used by the filter.
+
+    ``Raw price > SMA`` is intentionally calculated for every row here only for
+    display. Strategy decisions continue to use the sparse, persisted state
+    returned by ``calculate_market_filter_state``.
+    """
+    if rule != "Price > SMA":
+        raise ValueError(f"Unsupported market filter rule: {rule}")
+    if filter_asset not in prices.columns:
+        raise ValueError(f"Market filter asset is unavailable: {filter_asset}")
+
+    filter_series = prices[filter_asset]
+    evaluation_dates = make_filter_evaluation_dates(prices.index, evaluation_frequency)
+    evaluation_state = calculate_market_filter_state(
+        prices=prices,
+        filter_asset=filter_asset,
+        rule=rule,
+        sma_days=sma_days,
+        evaluation_frequency=evaluation_frequency,
+    )
+    sma = filter_series.rolling(sma_days, min_periods=sma_days).mean()
+    raw_state = (filter_series > sma).where(sma.notna())
+    persisted_state = evaluation_state.reindex(prices.index).astype("boolean").ffill().fillna(False).astype(bool)
+
+    trade_labels = pd.Series("", index=prices.index, dtype="object")
+    if not trades.empty:
+        labels = (
+            trades.assign(_label=trades["action"] + " " + trades["asset"])
+            .groupby("date")["_label"]
+            .agg("; ".join)
+        )
+        matching_dates = trade_labels.index.intersection(labels.index)
+        trade_labels.loc[matching_dates] = labels.reindex(matching_dates)
+
+    return pd.DataFrame({
+        "Date": prices.index,
+        f"{filter_asset} close": filter_series.values,
+        f"{filter_asset} SMA ({sma_days})": sma.values,
+        "Raw price > SMA": raw_state.values,
+        "Filter evaluation date": prices.index.isin(evaluation_dates),
+        "Persisted filter state": persisted_state.values,
+        "Current holding": holdings.reindex(prices.index, fill_value="CASH").values,
+        "Trade generated": trade_labels.values,
+    })
+
 # ---------- 10B. AGITQ SIGNAL MODULE ----------
 def _confirm_agitq_states(raw_states: pd.Series, confirmation_days: int):
     if confirmation_days not in (0, 2, 3):
@@ -919,6 +979,116 @@ def next_available_date(index: pd.DatetimeIndex, signal_dt: pd.Timestamp, mode: 
         return None
     return index[pos]
 
+# ---------- 11B. CANONICAL HAA SIGNALS ----------
+def haa_13612u(prices: pd.DataFrame, decision_dates: pd.DatetimeIndex) -> pd.DataFrame:
+    """Unweighted 1/3/6/12-month total-return momentum using month-end observations."""
+    output = pd.DataFrame(index=decision_dates, columns=prices.columns, dtype=float)
+    for dt in decision_dates:
+        now = last_price_on_or_before(prices, dt)
+        returns = []
+        for months in (1, 3, 6, 12):
+            then = last_price_on_or_before(prices, dt - pd.DateOffset(months=months))
+            returns.append(now / then - 1.0)
+        output.loc[dt] = sum(returns) / 4.0
+    return output
+
+def generate_haa_targets(prices: pd.DataFrame, strategy: str):
+    """Generate fixed canonical HAA targets, observed only at each month-end."""
+    if strategy == HAA_SIMPLE_STRATEGY_NAME:
+        offensive = ["SPY"]
+    elif strategy == HAA_BALANCED_STRATEGY_NAME:
+        offensive = HAA_BALANCED_OFFENSIVE
+    else:
+        raise ValueError("Unknown HAA strategy.")
+    assets = list(dict.fromkeys([HAA_CANARY] + offensive + HAA_DEFENSIVE))
+    missing = [asset for asset in assets if asset not in prices.columns]
+    if missing:
+        raise ValueError("Canonical HAA requires loaded adjusted-price datasets: " + ", ".join(missing))
+    dates = make_filter_evaluation_dates(prices.index, "Monthly")
+    # Require the full 12-month observation history instead of substituting a
+    # trading-day approximation.
+    dates = pd.DatetimeIndex([dt for dt in dates if dt - pd.DateOffset(months=12) >= prices.index.min()])
+    momentum = haa_13612u(prices[assets], dates)
+    targets, audits = [], []
+    for dt in dates:
+        row = momentum.loc[dt]
+        defensive = row[HAA_DEFENSIVE].idxmax()
+        risk_on = bool(row[HAA_CANARY] > 0)
+        weights = {asset: 0.0 for asset in assets if asset != HAA_CANARY}
+        ranking = ""
+        if not risk_on:
+            weights[defensive] = 1.0
+        elif strategy == HAA_SIMPLE_STRATEGY_NAME:
+            weights["SPY" if row["SPY"] > 0 else defensive] = 1.0
+        else:
+            selected = row[HAA_BALANCED_OFFENSIVE].sort_values(ascending=False).head(4)
+            ranking = ", ".join(selected.index)
+            for asset, value in selected.items():
+                weights[asset if value > 0 else defensive] += 0.25
+        targets.append(weights)
+        audits.append({
+            "Date": dt, "TIP 13612U momentum": row[HAA_CANARY],
+            "Regime": "Risk On" if risk_on else "Risk Off",
+            "Best defensive asset": defensive,
+            "Offensive ranking": ranking,
+            "Selected holdings": ", ".join(f"{asset} {weight:.0%}" for asset, weight in weights.items() if weight),
+            "Target weights": weights, **{f"{asset} 13612U": row[asset] for asset in assets},
+        })
+    return pd.DataFrame(targets, index=dates).fillna(0.0), pd.DataFrame(audits), momentum
+
+def backtest_weighted_monthly(prices, targets, initial_value=100000.0, tax_rate=DEFAULT_TAX_RATE, tx_cost=DEFAULT_TRANSACTION_COST, execution_mode="Next available close"):
+    """Independent weighted portfolio with monthly target-weight rebalancing and one-way costs."""
+    index, assets = prices.index, list(targets.columns)
+    units, cost_basis = pd.Series(0.0, index=assets), pd.Series(0.0, index=assets)
+    cash, trades, equity, holdings = float(initial_value), [], pd.Series(index=index, dtype=float), pd.Series(index=index, dtype="object")
+    executions = {}
+    for signal_dt, weights in targets.iterrows():
+        execution_dt = next_available_date(index, signal_dt, execution_mode)
+        if execution_dt is not None:
+            executions[execution_dt] = weights
+    for dt in index:
+        value = cash + float((units * prices.loc[dt, assets]).sum())
+        if dt in executions:
+            weights = executions[dt]
+            desired = weights * value
+            current = units * prices.loc[dt, assets]
+            # Sell first, then buy. Rebalancing is always evaluated even when holdings persist.
+            for asset in assets:
+                if current[asset] > desired[asset] + 1e-10:
+                    amount = current[asset] - desired[asset]
+                    sold_units = amount / prices.at[dt, asset]
+                    basis_sold = cost_basis[asset] * sold_units / units[asset] if units[asset] else 0.0
+                    units[asset] -= sold_units
+                    proceeds = amount * (1 - tx_cost)
+                    tax = max(proceeds - basis_sold, 0.0) * tax_rate
+                    cash += proceeds - tax
+                    cost_basis[asset] -= basis_sold
+                    trades.append({"date": dt, "action": "SELL", "asset": asset, "price": prices.at[dt, asset], "tax": tax, "value": proceeds - tax})
+            value_after_sells = cash + float((units * prices.loc[dt, assets]).sum())
+            desired = weights * value_after_sells
+            current = units * prices.loc[dt, assets]
+            for asset in assets:
+                if desired[asset] > current[asset] + 1e-10:
+                    amount = min(desired[asset] - current[asset], cash)
+                    if amount > 1e-10:
+                        units[asset] += amount * (1 - tx_cost) / prices.at[dt, asset]
+                        cash -= amount
+                        cost_basis[asset] += amount * (1 - tx_cost)
+                        trades.append({"date": dt, "action": "BUY", "asset": asset, "price": prices.at[dt, asset], "tax": 0.0, "value": amount})
+        equity.at[dt] = cash + float((units * prices.loc[dt, assets]).sum())
+        holdings.at[dt] = ", ".join(asset for asset in assets if units[asset] > 1e-10) or "CASH"
+    return equity, pd.DataFrame(trades), holdings
+
+def run_haa_test(strategy, base_currency="USD", initial_value=100000.0, tax_rate=0.25, tx_cost=0.001, execution_mode="Next available close", start_date=None, end_date=None):
+    assets = list(dict.fromkeys([HAA_CANARY] + (["SPY"] if strategy == HAA_SIMPLE_STRATEGY_NAME else HAA_BALANCED_OFFENSIVE) + HAA_DEFENSIVE))
+    all_prices = aligned_prices(assets, base_currency)
+    history = all_prices.loc[:pd.Timestamp(end_date)] if end_date is not None else all_prices
+    targets, audit, momentum = generate_haa_targets(history, strategy)
+    prices = history.loc[pd.Timestamp(start_date):] if start_date is not None else history
+    targets = targets.loc[targets.index <= prices.index.max()]
+    equity, trades, holdings = backtest_weighted_monthly(prices, targets, initial_value, tax_rate, tx_cost, execution_mode)
+    return {"equity": equity, "trades": trades, "holdings": holdings, "metrics": calculate_metrics(equity, trades, holdings, initial_value=initial_value), "haa_audit": audit, "haa_momentum": momentum, "settings": {"Strategy": strategy, "Execution": execution_mode, "Tax %": tax_rate * 100, "Transaction cost %": tx_cost * 100, "Initial capital": initial_value}, "cash_rate": 0.0, "benchmark": None, "benchmark_metrics": None, "initial_value": initial_value, "total_contributions": 0.0, "external_flows": pd.Series(0.0, index=equity.index)}
+
 # ---------- 12. BACKTEST ----------
 def backtest(
     prices: pd.DataFrame,
@@ -1013,6 +1183,31 @@ def backtest(
 
     trades_df = pd.DataFrame(trades)
     return equity.dropna(), trades_df, holding_hist.dropna()
+
+def backtest_buy_and_hold_core(
+    prices: pd.DataFrame,
+    asset: str,
+    initial_value: float,
+    tax_rate: float = DEFAULT_TAX_RATE,
+    tx_cost: float = DEFAULT_TRANSACTION_COST,
+    cash_rate: float = DEFAULT_CASH_RATE,
+):
+    """Run an independent, never-rebalanced Buy & Hold core using normal trade accounting."""
+    if asset not in prices.columns:
+        raise ValueError(f"Core asset is unavailable: {asset}")
+    if initial_value <= 0:
+        index = prices.index
+        return (
+            pd.Series(0.0, index=index),
+            pd.DataFrame(columns=["date", "action", "asset", "price", "tax", "value"]),
+            pd.Series("CASH", index=index, dtype="object"),
+        )
+    core_signal = pd.Series({prices.index[0]: asset}, dtype="object")
+    return backtest(
+        prices=prices[[asset]], signals=core_signal, initial_value=initial_value,
+        tax_rate=tax_rate, tx_cost=tx_cost, cash_rate=cash_rate,
+        execution_mode="Same close",
+    )
 
 def backtest_agitq(
     prices: pd.DataFrame,
@@ -1359,7 +1554,16 @@ def run_test(
     market_filter_asset=None,
     market_filter_rule="Price > SMA",
     market_filter_evaluation_frequency="Daily",
+    enable_core_strategy_split=False,
+    core_asset=None,
+    core_allocation_pct=0.0,
 ):
+    core_allocation_pct = float(core_allocation_pct)
+    if not 0 <= core_allocation_pct <= 100:
+        raise ValueError("Core allocation must be between 0% and 100%.")
+    core_enabled = bool(enable_core_strategy_split and core_asset not in (None, "None") and core_allocation_pct > 0)
+    if enable_core_strategy_split and core_allocation_pct > 0 and not core_enabled:
+        raise ValueError("Choose a core asset when Core + Strategy Split is enabled.")
     names = [primary]
     if secondary and secondary != "None" and secondary not in names:
         names.append(secondary)
@@ -1372,6 +1576,8 @@ def run_test(
     filter_asset = None if market_filter_asset in (None, "None") else market_filter_asset
     if filter_asset and filter_asset not in names:
         names.append(filter_asset)
+    if core_enabled and core_asset not in names:
+        names.append(core_asset)
 
     prices = aligned_prices(names, base_currency)
     start = pd.Timestamp(start_date).normalize() if start_date is not None else None
@@ -1411,15 +1617,55 @@ def run_test(
     period_signals = signals.loc[prices.index.min():prices.index.max()]
     signals = pd.concat([prior_signals.tail(1), period_signals])
 
-    equity, trades, holdings = backtest(
+    strategy_initial_value = initial_value * (1 - core_allocation_pct / 100) if core_enabled else initial_value
+    strategy_equity, strategy_trades, strategy_holdings = backtest(
         prices=prices,
         signals=signals,
-        initial_value=initial_value,
+        initial_value=strategy_initial_value,
         tax_rate=tax_rate,
         tx_cost=tx_cost,
         cash_rate=cash_rate,
         execution_mode=execution_mode,
     )
+    core_equity = None
+    core_trades = pd.DataFrame()
+    core_holdings = None
+    if core_enabled:
+        core_equity, core_trades, core_holdings = backtest_buy_and_hold_core(
+            prices=prices,
+            asset=core_asset,
+            initial_value=initial_value * core_allocation_pct / 100,
+            tax_rate=tax_rate,
+            tx_cost=tx_cost,
+            cash_rate=cash_rate,
+        )
+        equity = strategy_equity.add(core_equity, fill_value=0.0)
+        strategy_labeled_trades = strategy_trades.assign(Portion="Strategy")
+        core_labeled_trades = core_trades.assign(Portion="Core")
+        trades = pd.concat([strategy_labeled_trades, core_labeled_trades], ignore_index=True)
+        if not trades.empty:
+            trades = trades.sort_values("date", kind="stable").reset_index(drop=True)
+        holdings = pd.Series(
+            [f"Core: {core_holdings.loc[dt]} | Strategy: {strategy_holdings.loc[dt]}" for dt in equity.index],
+            index=equity.index,
+            dtype="object",
+        )
+    else:
+        equity, trades, holdings = strategy_equity, strategy_trades, strategy_holdings
+    filter_diagnostics = None
+    if filter_asset:
+        filter_diagnostics = build_market_filter_diagnostics(
+            prices=history,
+            filter_asset=filter_asset,
+            rule=market_filter_rule,
+            sma_days=sma_days,
+            evaluation_frequency=market_filter_evaluation_frequency,
+            holdings=strategy_holdings,
+            trades=strategy_trades,
+        )
+        filter_diagnostics = filter_diagnostics.loc[
+            filter_diagnostics["Date"].isin(prices.index)
+        ].reset_index(drop=True)
 
     metrics = calculate_metrics(
         equity, trades, holdings, initial_value=initial_value
@@ -1455,6 +1701,10 @@ def run_test(
         "Annual cash return %": cash_rate * 100,
         "Execution": execution_mode,
         "Initial capital": initial_value,
+        "Core + Strategy Split": core_enabled,
+        "Core asset": core_asset if core_enabled else None,
+        "Core allocation %": core_allocation_pct if core_enabled else None,
+        "Strategy allocation %": 100 - core_allocation_pct if core_enabled else None,
         "Market filter asset": filter_asset,
         "Market filter rule": market_filter_rule if filter_asset else None,
         "Market filter evaluation frequency": (
@@ -1474,6 +1724,11 @@ def run_test(
         "external_flows": pd.Series(0.0, index=equity.index, dtype=float),
         "initial_value": initial_value,
         "total_contributions": 0.0,
+        "core_enabled": core_enabled,
+        "core_asset": core_asset if core_enabled else None,
+        "core_allocation_pct": core_allocation_pct if core_enabled else 0.0,
+        "core_final_value": float(core_equity.iloc[-1]) if core_enabled else None,
+        "strategy_final_value": float(strategy_equity.iloc[-1]) if core_enabled else None,
         "settings": settings,
         "cash_rate": cash_rate,
         "market_filter_asset": filter_asset,
@@ -1482,6 +1737,7 @@ def run_test(
         "market_filter_evaluation_frequency": (
             market_filter_evaluation_frequency if filter_asset else None
         ),
+        "filter_diagnostics": filter_diagnostics,
     }
 
 def run_agitq_test(
@@ -1701,6 +1957,10 @@ def show_result(result, benchmark_label=None):
             f"Filter evaluation frequency: {result['market_filter_evaluation_frequency']}. "
             "When the rule is false or the SMA is unavailable, the strategy holds CASH."
         )
+        diagnostics = result.get("filter_diagnostics")
+        if diagnostics is not None:
+            print("\nFilter diagnostic (daily raw condition versus persisted state used by the strategy):")
+            display(diagnostics)
     else:
         print("\nMarket filter: None")
 
@@ -1994,6 +2254,175 @@ def saved_result_strategies():
     return [row[0] for row in rows]
 
 # ---------- 18. BATCH TEST ----------
+STANDARD_BATCH_STRATEGIES = [
+    "Buy & Hold",
+    "Absolute Momentum",
+    "Dual Momentum",
+    "Relative Momentum",
+    "SMA Trend",
+    "SMA Hysteresis Envelope",
+]
+
+def parse_batch_values(value_text, converter, label):
+    """Parse comma-separated existing setting values for the Batch Test controls."""
+    values = [part.strip() for part in (value_text or "").split(",") if part.strip()]
+    if not values:
+        raise ValueError(f"Enter at least one {label} value.")
+    try:
+        return [converter(value) for value in values]
+    except ValueError as exc:
+        raise ValueError(f"Invalid {label} value. Use comma-separated numbers.") from exc
+
+def batch_combination_count(**selections):
+    """Return the exact Cartesian-product size before executing a batch."""
+    count = 1
+    for values in selections.values():
+        count *= len(values)
+    return count
+
+def run_batch_test(
+    strategies,
+    primary_assets,
+    secondary_assets,
+    base_currencies,
+    frequencies,
+    lookbacks,
+    sma_days_values,
+    envelope_pcts,
+    tax_rates,
+    transaction_costs,
+    cash_rates,
+    initial_values,
+    execution_modes,
+    benchmark_assets,
+    filter_assets,
+    filter_frequencies,
+    start_date=None,
+    end_date=None,
+):
+    """Run selected standard-strategy settings through the normal ``run_test`` engine."""
+    selections = {
+        "strategies": strategies, "primary_assets": primary_assets,
+        "secondary_assets": secondary_assets, "base_currencies": base_currencies,
+        "frequencies": frequencies, "lookbacks": lookbacks,
+        "sma_days_values": sma_days_values, "envelope_pcts": envelope_pcts,
+        "tax_rates": tax_rates, "transaction_costs": transaction_costs,
+        "cash_rates": cash_rates, "initial_values": initial_values,
+        "execution_modes": execution_modes, "benchmark_assets": benchmark_assets,
+        "filter_assets": filter_assets, "filter_frequencies": filter_frequencies,
+    }
+    empty = [name for name, values in selections.items() if not values]
+    if empty:
+        raise ValueError(f"Batch Test requires a selection for: {', '.join(empty)}")
+    unsupported = set(strategies) - set(STANDARD_BATCH_STRATEGIES)
+    if unsupported:
+        raise ValueError("Batch Test supports standard strategies only; run AGITQ individually.")
+
+    rows = []
+    for values in product(*selections.values()):
+        (
+            strategy, primary, secondary, base_currency, frequency, lookback,
+            sma_days, envelope_pct, tax_rate, tx_cost, cash_rate, initial_value,
+            execution_mode, benchmark, filter_asset, filter_frequency,
+        ) = values
+        parameters = {
+            "Signal frequency": frequency,
+            "ROC months": lookback,
+            "SMA days": sma_days,
+            "Envelope %": envelope_pct * 100,
+            "Tax %": tax_rate * 100,
+            "Transaction cost %": tx_cost * 100,
+            "Cash return %": cash_rate * 100,
+            "Initial capital": initial_value,
+            "Execution": execution_mode,
+            "Base": base_currency,
+            "Filter": filter_asset,
+            "Filter evaluation": filter_frequency if filter_asset != "None" else None,
+        }
+        assets = ", ".join(
+            value for value in [primary, None if secondary == "None" else secondary,
+                                None if benchmark == "None" else f"Benchmark: {benchmark}",
+                                None if filter_asset == "None" else f"Filter: {filter_asset}"]
+            if value
+        )
+        row = {
+            "Strategy": strategy,
+            "Assets": assets,
+            "Parameters": "; ".join(f"{key}={value}" for key, value in parameters.items() if value is not None),
+        }
+        try:
+            result = run_test(
+                strategy=strategy, primary=primary, secondary=secondary,
+                base_currency=base_currency, frequency=frequency,
+                lookback_months=lookback, sma_days=sma_days, envelope_pct=envelope_pct,
+                tax_rate=tax_rate, tx_cost=tx_cost, cash_rate=cash_rate,
+                execution_mode=execution_mode, benchmark_asset=benchmark,
+                initial_value=initial_value, start_date=start_date, end_date=end_date,
+                market_filter_asset=filter_asset,
+                market_filter_evaluation_frequency=filter_frequency,
+            )
+            metrics = result["metrics"]
+            row.update({
+                "Test period": f"{metrics['Start'].date()} → {metrics['End'].date()}",
+                "CAGR": metrics["CAGR"],
+                "Max drawdown": metrics["Max Drawdown"],
+                "Volatility": metrics["Volatility"],
+                "Sharpe": metrics["Sharpe"],
+                "Final value": metrics["Final Value"],
+                "Trades": metrics["Trades"],
+                "Worst year": metrics["Worst Year"],
+                "Error": "",
+            })
+        except Exception as exc:
+            row.update({
+                "Test period": "", "CAGR": np.nan, "Max drawdown": np.nan,
+                "Volatility": np.nan, "Sharpe": np.nan, "Final value": np.nan,
+                "Trades": np.nan, "Worst year": np.nan, "Error": str(exc),
+            })
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+def filter_and_sort_batch_results(frame, sort_by="CAGR", ascending=False, metric=None, expression=None, text=""):
+    """Filter Batch Test results by any displayed metric and sort any displayed column."""
+    output = frame.copy()
+    if text and text.strip():
+        output = output[output.astype(str).apply(
+            lambda row: row.str.contains(text.strip(), case=False, na=False).any(), axis=1
+        )]
+    if metric and expression and expression.strip():
+        parsed = _parse_numeric_filter(
+            expression,
+            ratio=metric in {"CAGR", "Max drawdown", "Volatility", "Worst year"},
+        )
+        if parsed:
+            operator, value = parsed
+            output = output.loc[getattr(output[metric], {
+                ">": "gt", ">=": "ge", "<": "lt", "<=": "le", "=": "eq",
+            }[operator])(value)]
+    return output.sort_values(sort_by, ascending=ascending, na_position="last", kind="stable")
+
+def batch_result_highlights(frame):
+    """Return the best valid result for each requested Batch Test highlight."""
+    valid = frame[frame["Error"].eq("")].copy()
+    if valid.empty:
+        return pd.DataFrame(columns=["Highlight", "Strategy", "Assets", "Parameters", "Value"])
+    choices = [
+        ("Highest CAGR", "CAGR", "max"),
+        ("Lowest max drawdown", "Max drawdown", "min"),
+        ("Highest Sharpe", "Sharpe", "max"),
+    ]
+    rows = []
+    for label, metric, direction in choices:
+        series = valid[metric].dropna()
+        if series.empty:
+            continue
+        selected = valid.loc[series.idxmax() if direction == "max" else series.idxmin()]
+        rows.append({
+            "Highlight": label, "Strategy": selected["Strategy"], "Assets": selected["Assets"],
+            "Parameters": selected["Parameters"], "Value": selected[metric],
+        })
+    return pd.DataFrame(rows)
+
 def batch_momentum_test(
     primary,
     secondary_options,
@@ -2072,6 +2501,8 @@ strategy_dd = widgets.Dropdown(
         "Relative Momentum",
         "SMA Trend",
         "SMA Hysteresis Envelope",
+        HAA_SIMPLE_STRATEGY_NAME,
+        HAA_BALANCED_STRATEGY_NAME,
         AGITQ_STRATEGY_NAME,
     ],
     description="Strategy:"
@@ -2163,6 +2594,46 @@ end_date_picker = widgets.DatePicker(description="End date:")
 
 run_btn = widgets.Button(description="Run backtest", button_style="success")
 result_output = widgets.Output()
+
+# Batch Test uses the same standard-strategy engine as an individual run. Values
+# entered in the text controls are comma-separated, for example: ``6, 12, 18``.
+batch_strategies_sm = widgets.SelectMultiple(
+    options=STANDARD_BATCH_STRATEGIES, value=("Dual Momentum",), description="Strategies:",
+    layout=widgets.Layout(width="330px", height="130px"),
+)
+batch_primary_sm = widgets.SelectMultiple(options=[], description="Primary assets:", layout=widgets.Layout(width="260px", height="100px"))
+batch_secondary_sm = widgets.SelectMultiple(options=["None"], value=("None",), description="Second assets:", layout=widgets.Layout(width="260px", height="100px"))
+batch_benchmark_sm = widgets.SelectMultiple(options=["None"], value=("None",), description="Benchmarks:", layout=widgets.Layout(width="260px", height="100px"))
+batch_filter_asset_sm = widgets.SelectMultiple(options=["None"], value=("None",), description="Filter assets:", layout=widgets.Layout(width="260px", height="100px"))
+batch_base_sm = widgets.SelectMultiple(options=["USD", "ILS"], value=("USD",), description="Base:")
+batch_frequency_sm = widgets.SelectMultiple(options=["Daily", "Weekly", "Monthly"], value=("Monthly",), description="Signal frequency:")
+batch_execution_sm = widgets.SelectMultiple(options=["Next available close", "Same close"], value=("Next available close",), description="Execution:")
+batch_filter_frequency_sm = widgets.SelectMultiple(options=["Daily", "Weekly", "Monthly"], value=("Daily",), description="Filter frequency:")
+batch_lookbacks_box = widgets.Text(value="12", description="ROC months:", placeholder="6, 12, 18")
+batch_sma_days_box = widgets.Text(value="200", description="SMA days:", placeholder="100, 200")
+batch_envelopes_box = widgets.Text(value="5", description="Envelope %:", placeholder="0, 5")
+batch_tax_box = widgets.Text(value="25", description="Tax %:", placeholder="0, 25")
+batch_fee_box = widgets.Text(value="0.1", description="Trade cost %:", placeholder="0, 0.1")
+batch_cash_box = widgets.Text(value="0", description="Cash return %:", placeholder="0, 4")
+batch_initial_box = widgets.Text(value="100000", description="Start value:", placeholder="50000, 100000")
+batch_start_picker = widgets.DatePicker(description="Start date:")
+batch_end_picker = widgets.DatePicker(description="End date:")
+batch_count_html = widgets.HTML()
+batch_run_btn = widgets.Button(description="Run Batch Test", button_style="success")
+batch_sort_dd = widgets.Dropdown(
+    options=["Strategy", "Assets", "Parameters", "Test period", "CAGR", "Max drawdown", "Volatility", "Sharpe", "Final value", "Trades", "Worst year", "Error"],
+    value="CAGR", description="Sort by:",
+)
+batch_ascending_cb = widgets.Checkbox(value=False, description="Ascending")
+batch_metric_filter_dd = widgets.Dropdown(
+    options=["CAGR", "Max drawdown", "Volatility", "Sharpe", "Final value", "Trades", "Worst year"],
+    value="CAGR", description="Metric filter:",
+)
+batch_metric_filter_box = widgets.Text(description="Condition:", placeholder="> 10%")
+batch_text_filter_box = widgets.Text(description="Text filter:", placeholder="Strategy, asset, or parameter")
+batch_apply_filters_btn = widgets.Button(description="Apply sort / filters", button_style="info")
+batch_output = widgets.Output()
+batch_results = pd.DataFrame()
 
 history_strategy_dd = widgets.Dropdown(options=["All strategies"], description="Strategy:")
 history_asset_box = widgets.Text(description="Asset contains:", placeholder="QQQ")
@@ -2425,13 +2896,16 @@ def _apply_agitq_preset(_=None):
 
 def _strategy_changed(change=None):
     is_agitq = strategy_dd.value == AGITQ_STRATEGY_NAME
+    is_haa = strategy_dd.value in (HAA_SIMPLE_STRATEGY_NAME, HAA_BALANCED_STRATEGY_NAME)
     agitq_controls_box.layout.display = "" if is_agitq else "none"
     market_filter_controls_box.layout.display = "none" if is_agitq else ""
     for widget in [
         primary_dd, secondary_dd, freq_dd, execution_dd,
         lookback_slider, sma_slider, envelope_slider,
     ]:
-        widget.layout.display = "none" if is_agitq else ""
+        widget.layout.display = "none" if (is_agitq or (is_haa and widget is not execution_dd)) else ""
+    if is_haa:
+        market_filter_controls_box.layout.display = "none"
 
 agitq_variant_dd.observe(_apply_agitq_preset, names="value")
 strategy_dd.observe(_strategy_changed, names="value")
@@ -2446,14 +2920,124 @@ def refresh_strategy_dropdowns():
     benchmark_dd.options = ["None"] + opts
     market_filter_asset_dd.options = ["None"] + opts
     market_filter_asset_dd.value = selected_filter if selected_filter in opts else "None"
+    for widget, options in [
+        (batch_primary_sm, opts),
+        (batch_secondary_sm, ["None"] + opts),
+        (batch_benchmark_sm, ["None"] + opts),
+        (batch_filter_asset_sm, ["None"] + opts),
+    ]:
+        selected = tuple(value for value in widget.value if value in options)
+        widget.options = options
+        widget.value = selected or (("None",) if "None" in options else tuple())
     if opts:
         primary_dd.value = opts[0]
     refresh_agitq_asset_dropdowns()
+
+def _batch_selections_from_controls():
+    return {
+        "strategies": list(batch_strategies_sm.value),
+        "primary_assets": list(batch_primary_sm.value),
+        "secondary_assets": list(batch_secondary_sm.value),
+        "base_currencies": list(batch_base_sm.value),
+        "frequencies": list(batch_frequency_sm.value),
+        "lookbacks": parse_batch_values(batch_lookbacks_box.value, int, "ROC months"),
+        "sma_days_values": parse_batch_values(batch_sma_days_box.value, int, "SMA days"),
+        "envelope_pcts": [value / 100 for value in parse_batch_values(batch_envelopes_box.value, float, "envelope percentage")],
+        "tax_rates": [value / 100 for value in parse_batch_values(batch_tax_box.value, float, "tax percentage")],
+        "transaction_costs": [value / 100 for value in parse_batch_values(batch_fee_box.value, float, "transaction-cost percentage")],
+        "cash_rates": [value / 100 for value in parse_batch_values(batch_cash_box.value, float, "cash-return percentage")],
+        "initial_values": parse_batch_values(batch_initial_box.value, float, "starting value"),
+        "execution_modes": list(batch_execution_sm.value),
+        "benchmark_assets": list(batch_benchmark_sm.value),
+        "filter_assets": list(batch_filter_asset_sm.value),
+        "filter_frequencies": list(batch_filter_frequency_sm.value),
+    }
+
+def _refresh_batch_count(_=None):
+    try:
+        selections = _batch_selections_from_controls()
+        count = batch_combination_count(**selections)
+        batch_count_html.value = f"<b>{count:,}</b> combination(s) will be tested."
+    except Exception as exc:
+        batch_count_html.value = f"<span style='color:#b00020'>Fix Batch Test values: {exc}</span>"
+
+def _display_batch_results():
+    if batch_results.empty:
+        print("No Batch Test results yet.")
+        return
+    filtered = filter_and_sort_batch_results(
+        batch_results,
+        sort_by=batch_sort_dd.value,
+        ascending=batch_ascending_cb.value,
+        metric=batch_metric_filter_dd.value,
+        expression=batch_metric_filter_box.value,
+        text=batch_text_filter_box.value,
+    )
+    print(f"Showing {len(filtered):,} of {len(batch_results):,} completed combination(s).")
+    highlights = batch_result_highlights(filtered)
+    if not highlights.empty:
+        print("\nHighlights")
+        display(highlights)
+    display_frame = filtered.copy()
+    for column in ["CAGR", "Max drawdown", "Volatility", "Worst year"]:
+        display_frame[column] = display_frame[column].map(lambda value: "—" if pd.isna(value) else f"{value * 100:.2f}%")
+    display_frame["Sharpe"] = display_frame["Sharpe"].map(lambda value: "—" if pd.isna(value) else f"{value:.2f}")
+    display_frame["Final value"] = display_frame["Final value"].map(lambda value: "—" if pd.isna(value) else money(value))
+    display(display_frame)
+
+def _run_batch_clicked(_=None):
+    global batch_results
+    with batch_output:
+        clear_output()
+        try:
+            selections = _batch_selections_from_controls()
+            count = batch_combination_count(**selections)
+            if count == 0:
+                raise ValueError("Select at least one value for every Batch Test control.")
+            print(f"Running {count:,} combination(s) with the standard individual-backtest engine...")
+            batch_results = run_batch_test(
+                **selections,
+                start_date=batch_start_picker.value,
+                end_date=batch_end_picker.value,
+            )
+            _display_batch_results()
+        except Exception as exc:
+            print("ERROR:", exc)
+
+def _apply_batch_filters(_=None):
+    with batch_output:
+        clear_output()
+        try:
+            _display_batch_results()
+        except Exception as exc:
+            print("ERROR:", exc)
+
+for control in [
+    batch_strategies_sm, batch_primary_sm, batch_secondary_sm, batch_benchmark_sm,
+    batch_filter_asset_sm, batch_base_sm, batch_frequency_sm, batch_execution_sm,
+    batch_filter_frequency_sm, batch_lookbacks_box, batch_sma_days_box,
+    batch_envelopes_box, batch_tax_box, batch_fee_box, batch_cash_box, batch_initial_box,
+]:
+    control.observe(_refresh_batch_count, names="value")
+batch_run_btn.on_click(_run_batch_clicked)
+batch_apply_filters_btn.on_click(_apply_batch_filters)
+_refresh_batch_count()
 
 def _run_clicked(_):
     with result_output:
         clear_output()
         try:
+            if strategy_dd.value in (HAA_SIMPLE_STRATEGY_NAME, HAA_BALANCED_STRATEGY_NAME):
+                result = run_haa_test(
+                    strategy=strategy_dd.value, base_currency=base_dd.value,
+                    initial_value=initial_box.value, tax_rate=tax_box.value / 100, tx_cost=fee_box.value / 100,
+                    execution_mode=execution_dd.value, start_date=start_date_picker.value,
+                    end_date=end_date_picker.value,
+                )
+                show_result(result)
+                print("\nCanonical HAA monthly decision audit:")
+                display(result["haa_audit"])
+                return
             if strategy_dd.value == AGITQ_STRATEGY_NAME:
                 variant = agitq_variant_dd.value
                 hybrid = variant == "Hybrid 3/185/161"
@@ -2598,9 +3182,29 @@ def launch_backtester():
         run_btn,
         result_output
     ])
-    app_tabs = widgets.Tab(children=[backtest_box, history_box])
+    batch_box = widgets.VBox([
+        widgets.HTML("<h2>Batch Test</h2>"),
+        widgets.HTML(
+            "Choose multiple values to run their complete Cartesian product with the same engine used by an individual backtest. "
+            "AGITQ remains an individual-only test because it has a separate allocation engine."
+        ),
+        widgets.HBox([batch_strategies_sm, batch_primary_sm, batch_secondary_sm]),
+        widgets.HBox([batch_benchmark_sm, batch_filter_asset_sm]),
+        widgets.HBox([batch_base_sm, batch_frequency_sm, batch_execution_sm, batch_filter_frequency_sm]),
+        widgets.HBox([batch_lookbacks_box, batch_sma_days_box, batch_envelopes_box]),
+        widgets.HBox([batch_tax_box, batch_fee_box, batch_cash_box, batch_initial_box]),
+        widgets.HBox([batch_start_picker, batch_end_picker]),
+        batch_count_html,
+        batch_run_btn,
+        widgets.HTML("<h3>Results</h3><p>Sort by any displayed column. Filter a metric with expressions such as <code>&gt; 10%</code> or <code>&lt; 20</code>; text filtering searches all columns.</p>"),
+        widgets.HBox([batch_sort_dd, batch_ascending_cb, batch_metric_filter_dd, batch_metric_filter_box]),
+        widgets.HBox([batch_text_filter_box, batch_apply_filters_btn]),
+        batch_output,
+    ])
+    app_tabs = widgets.Tab(children=[backtest_box, batch_box, history_box])
     app_tabs.set_title(0, "Backtest")
-    app_tabs.set_title(1, "Results History")
+    app_tabs.set_title(1, "Batch Test")
+    app_tabs.set_title(2, "Results History")
     app_tabs.selected_index = 0
     display(app_tabs)
     refresh_results_history()
